@@ -37,7 +37,7 @@ Pop-Location
 if ($rc -ne 0) { throw 'rc.exe failed' }
 
 Write-Host '[2/2] compiling and linking ...'
-$clArgs = @('/nologo','/O2','/EHsc','/utf-8','/MD','/DUNICODE','/D_UNICODE',
+$clArgs = @('/nologo','/std:c++20','/O2','/EHsc','/utf-8','/MD','/DUNICODE','/D_UNICODE',
             '/D_CRT_SECURE_NO_WARNINGS', "/I$root\src", "/I$Deps\include",
             "$root\src\main.cpp","$root\src\capture.cpp","$root\src\view.cpp",
             "$root\src\ocr_tesseract.cpp","$root\src\ocraddon.cpp","$root\res\app.res",

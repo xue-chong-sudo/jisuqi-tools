@@ -73,9 +73,11 @@ void DrawTile(Gdiplus::Graphics& g, const Gdiplus::RectF& rect,
     Gdiplus::GraphicsPath p;
     RoundRectPath(p, rect, corner);
     Gdiplus::Color fill = selected ? cSelFill : cHover;
-    g.FillPath(&Gdiplus::SolidBrush(fill), &p);
+    Gdiplus::SolidBrush tileFillBrush(fill);
+    g.FillPath(&tileFillBrush, &p);
     Gdiplus::Color edge = selected ? cAccent : Gdiplus::Color(0xFF, 0xE3, 0xE3, 0xE6);
-    g.DrawPath(&Gdiplus::Pen(edge, 1.0f), &p);
+    Gdiplus::Pen tileEdgePen(edge, 1.0f);
+    g.DrawPath(&tileEdgePen, &p);
 }
 
 // 计算「图标 + 名字」内容块的几何：内容在视觉行高 rowH 里垂直居中，
@@ -126,7 +128,8 @@ static void DrawName(Gdiplus::Graphics& g, const Metrics& m,
     sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
     sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
     sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    g.DrawString(name.c_str(), -1, &f, nr, &sf, &Gdiplus::SolidBrush(cName));
+    Gdiplus::SolidBrush nameBrush(cName);
+    g.DrawString(name.c_str(), -1, &f, nr, &sf, &nameBrush);
 }
 
 // 第5条需求：给绑定了字母快捷键的图标画角标（图标右下角，粗体白字 + 黑描边）。

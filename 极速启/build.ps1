@@ -23,7 +23,7 @@ Write-Host '[2/3] compiling sources ...'
 $srcs = @('main.cpp','App.cpp','MainWindow.cpp','TrayIcon.cpp','MouseHook.cpp',
           'DragDrop.cpp','Config.cpp','IconManager.cpp','Pinyin.cpp','AutoStart.cpp',
           'settings_ui.cpp','jisuq_ui_layout.cpp')
-$clArgs = @('/nologo','/std:c++17','/O2','/MT','/EHsc','/Gy',
+$clArgs = @('/nologo','/std:c++20','/O2','/MT','/EHsc','/Gy',
             '/utf-8','/D_WIN32_WINNT=0x0A00','/D_WIN32_IE=0x0600','/DJISUQI_EMBEDDED',
             '/Iinclude','/c') + $srcs
 & "$msvc\bin\Hostx64\x64\cl.exe" @clArgs

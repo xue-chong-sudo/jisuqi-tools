@@ -695,7 +695,10 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
                 case AT_TEXT: {
                     // 「抓取文字」：就是一个「文」字（外框已按用户要求去掉），
                     // 字号与其他工具图标一致（约 22px），MeasureString 精确居中
-                    static gp::Font fText(&gp::FontFamily(L"Microsoft YaHei"),
+                    // /std:c++20 隐含 /permissive：不能再对临时对象取地址（C2102）。
+                    // FontFamily 必须先于 Font 构造、晚于 Font 析构，故一并提为 static。
+                    static gp::FontFamily ffText(L"Microsoft YaHei");
+                    static gp::Font fText(&ffText,
                                           22, gp::FontStyleRegular, gp::UnitPixel);
                     gp::SolidBrush tb(ink);
                     gp::StringFormat sf;

@@ -1814,28 +1814,36 @@ void MainWindow::Paint(HDC hdc) {
                 // drawer cell; accent insertion bar when a drawer member is
                 // dropped onto a parent-grid cell.
                 if (m_dragging && k == m_dragOverDrawer) {
-                    g.DrawRectangle(&Gdiplus::Pen(kAccent,
-                        static_cast<Gdiplus::REAL>(2 * s)),
+                    Gdiplus::Pen dragOverPen(kAccent,
+                        static_cast<Gdiplus::REAL>(2 * s));
+                    g.DrawRectangle(&dragOverPen,
                         cell.left + 1, cell.top + 1, m_cellW - 2, m_cellH - 2);
                 }
                 if (m_dragging && m_dragSrcDrawer >= 0) {
                     int ph = HitTestIcon(m_dragPt);
                     if (ph == k && ph != m_dragOverDrawer) {
-                        g.DrawLine(&Gdiplus::Pen(kAccent,
-                            static_cast<Gdiplus::REAL>(2 * s)),
-                            cell.left + 1, cell.top + 4,
-                            cell.left + 1, cell.bottom - 4);
+                        Gdiplus::Pen drawerInsPen(kAccent,
+                            static_cast<Gdiplus::REAL>(2 * s));
+                        g.DrawLine(&drawerInsPen,
+                            static_cast<int>(cell.left + 1),
+                            static_cast<int>(cell.top + 4),
+                            static_cast<int>(cell.left + 1),
+                            static_cast<int>(cell.bottom - 4));
                     }
                 }
             }
             g.ResetClip();
             // ~65% white veil over the upper half.
-            g.FillRectangle(&Gdiplus::SolidBrush(
-                Gdiplus::Color(0xA8, 0xFF, 0xFF, 0xFF)),
-                m_rcGrid.left, m_rcGrid.top,
-                m_rcGrid.right - m_rcGrid.left, splitY - m_rcGrid.top);
+            Gdiplus::SolidBrush veilBrush(
+                Gdiplus::Color(0xA8, 0xFF, 0xFF, 0xFF));
+            g.FillRectangle(&veilBrush,
+                static_cast<int>(m_rcGrid.left),
+                static_cast<int>(m_rcGrid.top),
+                static_cast<int>(m_rcGrid.right - m_rcGrid.left),
+                static_cast<int>(splitY - m_rcGrid.top));
             // Subtle divider at the split.
-            g.DrawLine(&Gdiplus::Pen(kSubtle, static_cast<Gdiplus::REAL>(1 * s)),
+            Gdiplus::Pen splitLinePen(kSubtle, static_cast<Gdiplus::REAL>(1 * s));
+            g.DrawLine(&splitLinePen,
                        m_rcGrid.left, splitY, m_rcGrid.right, splitY);
             // Drawer name (centered in the upper half), recorded for hit-test.
             int dw = static_cast<int>(160 * s), dh = static_cast<int>(28 * s);
@@ -1880,8 +1888,9 @@ void MainWindow::Paint(HDC hdc) {
                     k == static_cast<int>(m_dragSrcMember)) {
                     Gdiplus::Rect sel(cell.left + 2, cell.top + 2,
                                       m_cellW - 4, m_cellH - 4);
-                    g.FillRectangle(&Gdiplus::SolidBrush(
-                        Gdiplus::Color(0xC8, 0xFF, 0xFF, 0xFF)), sel);
+                    Gdiplus::SolidBrush memberSelBrush(
+                        Gdiplus::Color(0xC8, 0xFF, 0xFF, 0xFF));
+                    g.FillRectangle(&memberSelBrush, sel);
                 }
                 DrawItem(g, d.members[k], cell,
                          (k == m_downIndex), (k == m_renamingMember), s);
@@ -1892,9 +1901,13 @@ void MainWindow::Paint(HDC hdc) {
                 if (mi >= 0) {
                     RECT mc = MemberCellRect(mi);
                     mc.top -= m_scrollY; mc.bottom -= m_scrollY;
-                    g.DrawLine(&Gdiplus::Pen(kAccent,
-                        static_cast<Gdiplus::REAL>(2 * s)),
-                        mc.left + 1, mc.top + 4, mc.left + 1, mc.bottom - 4);
+                    Gdiplus::Pen memberDropPen(kAccent,
+                        static_cast<Gdiplus::REAL>(2 * s));
+                    g.DrawLine(&memberDropPen,
+                        static_cast<int>(mc.left + 1),
+                        static_cast<int>(mc.top + 4),
+                        static_cast<int>(mc.left + 1),
+                        static_cast<int>(mc.bottom - 4));
                 }
             }
             g.ResetClip();
@@ -1925,8 +1938,9 @@ void MainWindow::Paint(HDC hdc) {
             if (m_dragging && m_dragSrcDrawer < 0 && k == m_dragFrom) {
                 Gdiplus::Rect sel(cell.left + 2, cell.top + 2,
                                   m_cellW - 4, m_cellH - 4);
-                g.FillRectangle(&Gdiplus::SolidBrush(
-                    Gdiplus::Color(0xC8, 0xFF, 0xFF, 0xFF)), sel);
+                Gdiplus::SolidBrush gridSelBrush(
+                    Gdiplus::Color(0xC8, 0xFF, 0xFF, 0xFF));
+                g.FillRectangle(&gridSelBrush, sel);
             }
             bool skip = (k == m_renamingIndex);
             DrawItem(g, cfg.items[m_visible[k]], cell,
@@ -1943,8 +1957,9 @@ void MainWindow::Paint(HDC hdc) {
                     int bx = (insVi < count) ? cell.left + 1
                                              : cell.right - 1;
                     int ly0 = cell.top + 4, ly1 = cell.bottom - 4;
-                    g.DrawLine(&Gdiplus::Pen(kAccent,
-                               static_cast<Gdiplus::REAL>(2 * s)),
+                    Gdiplus::Pen insBarPen(kAccent,
+                               static_cast<Gdiplus::REAL>(2 * s));
+                    g.DrawLine(&insBarPen,
                                bx, ly0, bx, ly1);
                 }
             }
@@ -1956,18 +1971,26 @@ void MainWindow::Paint(HDC hdc) {
     if (m_maxScroll > 0) {
         RECT track = ScrollbarRect();
         RECT thumb = ScrollbarThumbRect();
-        g.FillRectangle(&Gdiplus::SolidBrush(Gdiplus::Color(0xFF, 0xF0, 0xF0, 0xF0)),
-                        track.left, track.top,
-                        track.right - track.left, track.bottom - track.top);
-        g.FillRectangle(&Gdiplus::SolidBrush(Gdiplus::Color(0xFF, 0xC4, 0xC4, 0xC4)),
-                        thumb.left, thumb.top,
-                        thumb.right - thumb.left, thumb.bottom - thumb.top);
+        Gdiplus::SolidBrush trackBrush(Gdiplus::Color(0xFF, 0xF0, 0xF0, 0xF0));
+        g.FillRectangle(&trackBrush,
+                        static_cast<int>(track.left),
+                        static_cast<int>(track.top),
+                        static_cast<int>(track.right - track.left),
+                        static_cast<int>(track.bottom - track.top));
+        Gdiplus::SolidBrush thumbBrush(Gdiplus::Color(0xFF, 0xC4, 0xC4, 0xC4));
+        g.FillRectangle(&thumbBrush,
+                        static_cast<int>(thumb.left),
+                        static_cast<int>(thumb.top),
+                        static_cast<int>(thumb.right - thumb.left),
+                        static_cast<int>(thumb.bottom - thumb.top));
     }
 
     // ===== Title bar + search card (drawn last, on top). =====
     // 浅灰标题栏 + 底部 1px 分隔线（原来是 #F3F3F3 的硬边色块，显得旧）。
-    g.FillRectangle(&Gdiplus::SolidBrush(kTitleBg), 0, 0, cr.right, m_titleH);
-    g.FillRectangle(&Gdiplus::SolidBrush(kTitleLine), 0, m_titleH - 1, cr.right, 1);
+    Gdiplus::SolidBrush titleBgBrush(kTitleBg);
+    g.FillRectangle(&titleBgBrush, 0, 0, cr.right, m_titleH);
+    Gdiplus::SolidBrush titleLineBrush(kTitleLine);
+    g.FillRectangle(&titleLineBrush, 0, m_titleH - 1, cr.right, 1);
 
     // Tabs (group names). Clip to the label region [tabStartX .. gearLeft] so a
     // tab whose width estimate is slightly too small can NEVER paint over the
@@ -1999,7 +2022,8 @@ void MainWindow::Paint(HDC hdc) {
                                     static_cast<Gdiplus::REAL>(tr.bottom - tr.top) - 4);
                 Gdiplus::GraphicsPath pillPath;
                 JisuqUI::RoundRectPath(pillPath, pill, static_cast<Gdiplus::REAL>(10 * s));
-                g.FillPath(&Gdiplus::SolidBrush(kTabActive), &pillPath);
+                Gdiplus::SolidBrush pillBrush(kTabActive);
+                g.FillPath(&pillBrush, &pillPath);
             }
             if (!renaming) {
                 Gdiplus::SolidBrush* tbr = cur
@@ -2014,8 +2038,12 @@ void MainWindow::Paint(HDC hdc) {
             }
             // Accent border while dragging an icon over this tab.
             if (m_dragOverTab == gi) {
-                g.DrawRectangle(&Gdiplus::Pen(kAccent, static_cast<Gdiplus::REAL>(2 * s)),
-                                tr.left, tr.top, tr.right - tr.left - 1, tr.bottom - tr.top - 1);
+                Gdiplus::Pen tabDragPen(kAccent, static_cast<Gdiplus::REAL>(2 * s));
+                g.DrawRectangle(&tabDragPen,
+                                static_cast<int>(tr.left),
+                                static_cast<int>(tr.top),
+                                static_cast<int>(tr.right - tr.left - 1),
+                                static_cast<int>(tr.bottom - tr.top - 1));
             }
         }
         g.ResetClip();
@@ -2064,7 +2092,8 @@ void MainWindow::Paint(HDC hdc) {
         Gdiplus::GraphicsPath cardPath;
         JisuqUI::RoundRectPath(cardPath, card, static_cast<Gdiplus::REAL>(9 * s));
         g.FillPath(&bg, &cardPath);
-        g.DrawPath(&Gdiplus::Pen(kCardBorder, static_cast<Gdiplus::REAL>(1.0f)), &cardPath);
+        Gdiplus::Pen cardBorderPen(kCardBorder, static_cast<Gdiplus::REAL>(1.0f));
+        g.DrawPath(&cardBorderPen, &cardPath);
 
         // 放大镜（左侧图标区；EDIT 从该区域右侧开始，见 Relayout）。
         Gdiplus::REAL mx = card.X + static_cast<Gdiplus::REAL>(12 * s);
@@ -2087,8 +2116,9 @@ void MainWindow::Paint(HDC hdc) {
     }
 
     // Outer border for the borderless window.
-    g.DrawRectangle(&Gdiplus::Pen(Gdiplus::Color(0xFF, 0xE0, 0xE0, 0xE0),
-                                 static_cast<Gdiplus::REAL>(1 * s)),
+    Gdiplus::Pen outerBorderPen(Gdiplus::Color(0xFF, 0xE0, 0xE0, 0xE0),
+                                 static_cast<Gdiplus::REAL>(1 * s));
+    g.DrawRectangle(&outerBorderPen,
                     0, 0, cr.right - 1, cr.bottom - 1);
 
     // Settings entry: a gear glyph (replaces the old "设置" text label).
