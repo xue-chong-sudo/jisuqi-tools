@@ -1,0 +1,77 @@
+# ==========================================================
+# 极速启工具集 - 通用忽略规则
+# 只入库：源码 / 构建脚本 / 文档 / 图标与资源脚本
+# 不入库：编译产物、第三方依赖、用户数据、临时文件
+# 说明：以下规则对根目录和所有子目录生效（无前导斜杠 = 任意层级匹配）
+# ==========================================================
+
+# ---------- 1. 编译产物 ----------
+dist/
+build/
+out/
+*.obj
+*.o
+*.lo
+*.slo
+*.res
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.a
+*.pch
+*.gch
+*.tlog
+*.lastbuildstate
+*.exe
+*.dll
+*.tlb
+*.aps
+*.pyc
+*.VC.db
+*.VC.opendb
+.vs/
+x64/
+x86/
+Debug/
+Release/
+CMakeFiles/
+CMakeCache.txt
+__pycache__/
+
+# ---------- 2. 第三方依赖（体积大，不入库）----------
+deps/
+third_party/
+thirdparty/
+vcpkg_installed/
+tessdata/
+leptonica-*.dll
+tesseract-*.dll
+
+# ---------- 3. 用户数据与运行时配置 ----------
+data/
+data/cache/
+cache/
+icons/
+*.idx
+*.dat
+config.json
+settings.ini
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# ---------- 4. 临时与日志 ----------
+*.tmp
+*.temp
+*.log
+*.bak
+*.orig
+*.swp
+Thumbs.db
+desktop.ini
+
+# ---------- 5. 系统与编辑器 ----------
+.DS_Store

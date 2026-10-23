@@ -1,0 +1,5 @@
+#include "resource.h"
+
+// Tray / window icon. The app.ico file is generated at build time and
+// sits next to this .rc so the resource compiler can pick it up.
+IDI_APP ICON "app.ico"

@@ -1,0 +1,10 @@
+# 显式声明二进制资源，避免在不同平台的 autocrlf 设置下被当成文本做换行转换而损坏
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.bmp   binary
+*.cur   binary
+*.rar   binary
+*.zip   binary

@@ -1,0 +1,2 @@
+// Screenshot OCR host icon. Resource ID 1 = application icon (lowest ID wins).
+1 ICON "app.ico"

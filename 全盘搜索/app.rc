@@ -1,0 +1,7 @@
+#include <winuser.h>
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+#define IDI_APP 101
+IDI_APP ICON "app.ico"
+1 RT_MANIFEST "app.manifest"
