@@ -131,6 +131,9 @@ bool App::Init(HINSTANCE hInst) {
 
     m_hook.Install(m_mainWindow.GetHwnd());
     ApplySettings();       // (re)apply hotkey / auto-start before showing
+    // 预热截图识字宿主：在后台提前加载 OCR 引擎，避免「每次首次触发截图」时
+    // 因 OCR 初始化（约 1~3 秒）而卡住。宿主为常驻隐藏进程，预热后每次触发即秒开。
+    EnsureShotHostRunning();
     m_mainWindow.Show();   // open the launch panel on startup
     return true;
 }

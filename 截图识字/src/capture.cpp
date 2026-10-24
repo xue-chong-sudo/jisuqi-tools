@@ -389,11 +389,15 @@ CaptureImage CaptureRegionInteractive() {
     g.dim = g.screen;
     unsigned char* dp = g.dim.data();
     const int dimMul = 140; // darken to 55%: result = desktop * 0.55
+    // 用 256 项查找表代替每像素 3 次乘除法：结果与 (v*140/255) 完全等价，
+    // 但把 3 次乘除降为 3 次查表，整屏（数百万像素）叠加时明显更快。
+    unsigned char lut[256];
+    for (int v = 0; v < 256; v++) lut[v] = (unsigned char)(v * dimMul / 255);
     for (int i = 0; i < g.vw * g.vh; i++) {
-        dp[0] = (unsigned char)((dp[0] * dimMul) / 255); // B
-        dp[1] = (unsigned char)((dp[1] * dimMul) / 255); // G
-        dp[2] = (unsigned char)((dp[2] * dimMul) / 255); // R
-        dp[3] = 255;                                     // A
+        dp[0] = lut[dp[0]]; // B
+        dp[1] = lut[dp[1]]; // G
+        dp[2] = lut[dp[2]]; // R
+        dp[3] = 255;        // A
         dp += 4;
     }
 
