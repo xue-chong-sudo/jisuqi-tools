@@ -180,17 +180,24 @@ static int ClassifyExt(const std::wstring& ext) {
 // ============================================================
 // 2. index store
 // ============================================================
+#pragma pack(push, 1)
 struct Rec {
-    uint32_t nameOff = 0, nameLen = 0, lowerOff = 0, lowerLen = 0, parent = 0;
-    uint64_t size = 0, mtime = 0;
-    uint32_t attrs = 0;
-    uint8_t  cat = CAT_OTHER;
+    uint32_t nameOff, nameLen, lowerOff, lowerLen, parent;
+    uint64_t size, mtime;
+    uint32_t attrs;
+    uint8_t  cat;
 };
+#pragma pack(pop)
+static_assert(sizeof(Rec) == 41, "Rec must be 41B packed (disk == memory layout)");
+
 struct Vol {
     wchar_t letter = 0;
+    uint32_t ver = 1;                      // 磁盘格式版本：1=旧，2=DFS preorder + subtreeEnd
+    std::wstring parentPath;               // v2：片的外部父路径（整卷片为空）
     std::vector<Rec> recs;
     std::string nameBlob, lowerBlob;
-    std::vector<std::wstring> dirs;   // dirs[0] = L"C:"
+    std::vector<std::wstring> dirs;        // v2：DFS preorder；dirs[0]=L"C:"
+    std::vector<uint32_t> subtreeEnd;      // v2：每个目录子树右端点（exclusive）
 };
 using Snapshot = std::vector<std::shared_ptr<Vol>>;
 static std::atomic<std::shared_ptr<Snapshot>> g_snap{ std::make_shared<Snapshot>() };
@@ -258,12 +265,6 @@ static std::wstring TimeStr(uint64_t ft) {
 
 // ---------------- idx persistence ----------------
 #pragma pack(push, 1)
-struct RecP {
-    uint32_t nameOff, nameLen, lowerOff, lowerLen, parent;
-    uint64_t size, mtime;
-    uint32_t attrs;
-    uint8_t  cat;
-};
 struct IdxHead {
     char     magic[8];      // "WBSVOL1\0"
     uint32_t ver;
@@ -272,6 +273,7 @@ struct IdxHead {
     uint64_t nRecs, nDirs;
 };
 #pragma pack(pop)
+static_assert(sizeof(IdxHead) == 40, "IdxHead layout");
 static const char IDX_MAGIC[8] = { 'W','B','S','V','O','L','1','\0' };
 static const uint64_t REFRESH_INTERVAL = 6ull * 3600 * 10000000; // 6h in FILETIME ticks(100ns)=6h*36e8? use filetime compare below
 static const uint64_t SIX_HOURS_TICKS = 6ull * 3600 * 1000 * 10000; // 6h * 10^7
@@ -285,20 +287,34 @@ static bool SaveVol(const std::wstring& path, const Vol& v, uint64_t buildTime) 
     do {
         IdxHead h{};
         memcpy(h.magic, IDX_MAGIC, 8);
-        h.ver = 1; h.buildTime = buildTime; h.letter = v.letter;
+        h.ver = 2; h.buildTime = buildTime; h.letter = v.letter;
         h.nRecs = v.recs.size(); h.nDirs = v.dirs.size();
         if (fwrite(&h, sizeof h, 1, f) != 1) { ok = false; break; }
+        // v2：片的外部父路径（整卷片为空）
+        {
+            std::string pp = W8(v.parentPath);
+            uint16_t l = (uint16_t)pp.size();
+            if (fwrite(&l, 2, 1, f) != 1 || (l && fwrite(pp.data(), 1, l, f) != l)) { ok = false; break; }
+        }
         for (auto& d : v.dirs) {
             std::string u = W8(d);
             uint16_t l = (uint16_t)u.size();
-            if (fwrite(&l, 2, 1, f) != 1 || fwrite(u.data(), 1, l, f) != l) { ok = false; break; }
+            if (fwrite(&l, 2, 1, f) != 1 || (l && fwrite(u.data(), 1, l, f) != l)) { ok = false; break; }
         }
         if (!ok) break;
-        for (auto& r : v.recs) {
-            RecP p{ r.nameOff, r.nameLen, r.lowerOff, r.lowerLen, r.parent, r.size, r.mtime, r.attrs, r.cat };
-            if (fwrite(&p, sizeof p, 1, f) != 1) { ok = false; break; }
+        // v2：subtreeEnd（长度必须 = nDirs）
+        if (h.nDirs) {
+            if (v.subtreeEnd.size() == v.dirs.size()) {
+                if (fwrite(v.subtreeEnd.data(), sizeof(uint32_t), v.subtreeEnd.size(), f) != v.subtreeEnd.size()) { ok = false; break; }
+            } else {
+                std::vector<uint32_t> zeros((size_t)h.nDirs, 0);
+                if (fwrite(zeros.data(), sizeof(uint32_t), zeros.size(), f) != zeros.size()) { ok = false; break; }
+            }
         }
-        if (!ok) break;
+        // v2：recs 直接写 41B 原始布局（磁盘 = 内存）
+        if (h.nRecs) {
+            if (fwrite(v.recs.data(), sizeof(Rec), v.recs.size(), f) != v.recs.size()) { ok = false; break; }
+        }
         uint64_t nl = v.nameBlob.size(), ll = v.lowerBlob.size();
         if (fwrite(&nl, 8, 1, f) != 1 || fwrite(v.nameBlob.data(), 1, (size_t)nl, f) != nl ||
             fwrite(&ll, 8, 1, f) != 1 || fwrite(v.lowerBlob.data(), 1, (size_t)ll, f) != ll) ok = false;
@@ -324,9 +340,17 @@ static bool LoadVol(const std::wstring& path, Vol& v, uint64_t& buildTime) {
     do {
         IdxHead hd{};
         if (!rd(&hd, sizeof hd)) break;
-        if (memcmp(hd.magic, IDX_MAGIC, 8) != 0 || hd.ver != 1) break;
-        v = Vol{}; v.letter = (wchar_t)hd.letter; buildTime = hd.buildTime;
+        if (memcmp(hd.magic, IDX_MAGIC, 8) != 0) break;
+        if (hd.ver != 1 && hd.ver != 2) break;   // 未知版本：降级为"无缓存"→ 调用方重建
+        v = Vol{}; v.letter = (wchar_t)hd.letter; v.ver = hd.ver; buildTime = hd.buildTime;
         ok = true;
+        if (hd.ver >= 2) {                        // v2：外部父路径
+            uint16_t pl = 0;
+            if (!rd(&pl, 2)) { ok = false; break; }
+            std::string pu((size_t)pl, 0);
+            if (pl && !rd(pu.data(), pl)) { ok = false; break; }
+            v.parentPath = U8(pu);
+        }
         for (uint64_t i = 0; i < hd.nDirs && ok; i++) {
             uint16_t l = 0;
             if (!rd(&l, 2)) { ok = false; break; }
@@ -335,14 +359,12 @@ static bool LoadVol(const std::wstring& path, Vol& v, uint64_t& buildTime) {
             v.dirs.push_back(U8(u));
         }
         if (!ok) break;
-        v.recs.resize((size_t)hd.nRecs);
-        for (uint64_t i = 0; i < hd.nRecs && ok; i++) {
-            RecP p{};
-            if (!rd(&p, sizeof p)) { ok = false; break; }
-            Rec& r = v.recs[(size_t)i];
-            r.nameOff = p.nameOff; r.nameLen = p.nameLen; r.lowerOff = p.lowerOff; r.lowerLen = p.lowerLen;
-            r.parent = p.parent; r.size = p.size; r.mtime = p.mtime; r.attrs = p.attrs; r.cat = p.cat;
+        if (hd.ver >= 2) {                        // v2：subtreeEnd
+            v.subtreeEnd.resize((size_t)hd.nDirs);
+            if (hd.nDirs && !rd(v.subtreeEnd.data(), (size_t)hd.nDirs * sizeof(uint32_t))) { ok = false; break; }
         }
+        v.recs.resize((size_t)hd.nRecs);
+        if (hd.nRecs && !rd(v.recs.data(), (size_t)hd.nRecs * sizeof(Rec))) { ok = false; break; }
         if (!ok) break;
         uint64_t nl = 0, ll = 0;
         if (!rd(&nl, 8)) { ok = false; break; }
@@ -411,14 +433,27 @@ static void TrimVol(Vol& v) {
 
 static void WalkVolume(wchar_t letter, Vol& v, std::stop_token st) {
     v.letter = letter;
+    v.ver = 2;
     std::wstring root;
     root.push_back(letter); root += L":\\";
-    v.dirs.push_back(root.substr(0, 2)); // "C:"
-    struct Q { std::wstring path; uint32_t parent; };
-    std::deque<Q> q; q.push_back({ root, 0 });
+    v.dirs.push_back(root.substr(0, 2)); // dirs[0] = "C:"
+    v.subtreeEnd.clear();
+    std::vector<uint32_t> dirParent;     // 临时：目录父下标（用于算 subtreeEnd）
+    dirParent.push_back(0);
+    struct Q { std::wstring path; uint32_t parent; bool isRoot; };
+    std::vector<Q> stack;
+    stack.push_back({ root, 0, true });
     uint64_t count = 0;
-    while (!q.empty() && !st.stop_requested()) {
-        auto cur = q.front(); q.pop_front();
+    while (!stack.empty() && !st.stop_requested()) {
+        Q cur = std::move(stack.back()); stack.pop_back();
+        uint32_t self;
+        if (cur.isRoot) {
+            self = 0;
+        } else {
+            self = (uint32_t)v.dirs.size();
+            v.dirs.push_back(cur.path.substr(0, cur.path.size() - 1));  // 去掉尾部 '\'
+            dirParent.push_back(cur.parent);
+        }
         WIN32_FIND_DATAW fd{};
         HANDLE h = FindFirstFileExW((cur.path + L"*").c_str(), FindExInfoBasic, &fd,
                                     FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
@@ -434,18 +469,14 @@ static void WalkVolume(wchar_t letter, Vol& v, std::stop_token st) {
             Rec r;
             r.nameOff = (uint32_t)v.nameBlob.size(); r.nameLen = (uint32_t)u8.size();
             r.lowerOff = (uint32_t)v.lowerBlob.size(); r.lowerLen = (uint32_t)u8l.size();
-            r.parent = cur.parent;
+            r.parent = self;
             r.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             r.mtime = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
             r.attrs = fd.dwFileAttributes;
             r.cat = isDir ? (uint8_t)CAT_DIR : (uint8_t)ClassifyExt(ExtOf(wname));
             v.nameBlob.append(u8); v.lowerBlob.append(u8l);
             v.recs.push_back(r);
-            if (isDir) {
-                uint32_t nid = (uint32_t)v.dirs.size();
-                v.dirs.push_back(cur.path + nm);            // no trailing slash
-                q.push_back({ cur.path + nm + L"\\", nid });
-            }
+            if (isDir) stack.push_back({ cur.path + nm + L"\\", self, false });
             if (++count % 20000 == 0) {
                 wchar_t b[80];
                 swprintf(b, 80, L"正在建立索引：%c: (%llu 个文件)", (wchar_t)letter, (unsigned long long)count);
@@ -454,6 +485,15 @@ static void WalkVolume(wchar_t letter, Vol& v, std::stop_token st) {
         } while (FindNextFileW(h, &fd) && !st.stop_requested());
         FindClose(h);
     }
+    // DFS preorder ⇒ 每个目录的子树是连续区间：subtreeEnd[i] = 子树右端点(exclusive)
+    size_t n = v.dirs.size();
+    v.subtreeEnd.assign(n, 0);
+    for (size_t i = 0; i < n; i++) v.subtreeEnd[i] = (uint32_t)(i + 1);
+    for (size_t i = n; i-- > 1; ) {
+        uint32_t p = dirParent[i];
+        if (v.subtreeEnd[i] > v.subtreeEnd[p]) v.subtreeEnd[p] = v.subtreeEnd[i];
+    }
+    v.parentPath.clear();   // 整卷片：无外部父路径
 }
 
 // ---------------- Phase1：监听 / 调度 / 重扫 ----------------
@@ -666,8 +706,15 @@ static void IndexerThread(std::stop_token st) {
             }
             // 先用缓存立即出结果（即便略旧），避免"启动空白等扫描"。
             if (have) CommitVol(loaded);
-            // 缓存足够新（10 分钟内）就不重扫；否则后台重扫刷新（用户无需手动刷新）。
-            if (have && bt > 0 && now - bt < STARTUP_STALE_TICKS) continue;
+            // P1a：旧格式(ver<2)先用旧缓存出结果，但后台强制重建为 ver=2（首次启动会全量重建）。
+            bool needUpgrade = have && loaded->ver < 2;
+            if (needUpgrade) {
+                wchar_t ub[64];
+                swprintf(ub, 64, L"正在升级索引格式：%c:", (wchar_t)letter);
+                SetIndexStatus(ub);
+            }
+            // 缓存足够新（24 小时内且已是新格式）就不重扫；否则后台重扫刷新。
+            if (!needUpgrade && have && bt > 0 && now - bt < STARTUP_STALE_TICKS) continue;
             // rebuild
             auto v = std::make_shared<Vol>();
             ReserveFromIdx(idxPath, *v);
