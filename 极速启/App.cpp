@@ -193,6 +193,9 @@ void App::Quit() {
     // 通知截图识字宿主退出（插件常驻进程随主程序一起收尾；找不到则无操作）
     if (HWND host = FindWindowW(kShotHostClass, nullptr))
         PostMessageW(host, WM_CLOSE, 0, 0);
+    // 通知全盘搜索常驻进程显式退出（WM_APP+101），避免留下孤儿进程。
+    if (HWND search = FindWindowW(L"JisuqiFullDiskSearch", nullptr))
+        PostMessageW(search, WM_APP + 101, 0, 0);
     if (m_mainWindow.GetHwnd())
         DestroyWindow(m_mainWindow.GetHwnd());
     PostQuitMessage(0);
