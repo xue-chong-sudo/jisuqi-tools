@@ -388,6 +388,27 @@ static void CommitVol(std::shared_ptr<Vol> v) {
     g_snap.store(ns);
 }
 
+// ---- P0：按上次 idx 头部记录数预分配 + 构建后回收多余容量 ----
+static void ReserveFromIdx(const std::wstring& idxPath, Vol& v) {
+    HANDLE h = CreateFileW(idxPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    IdxHead hd{}; DWORD got = 0;
+    if (ReadFile(h, &hd, sizeof hd, &got, nullptr) && got == sizeof hd &&
+        memcmp(hd.magic, IDX_MAGIC, 8) == 0) {
+        v.recs.reserve((size_t)(hd.nRecs + hd.nRecs / 5) + 64);
+        v.dirs.reserve((size_t)(hd.nDirs + hd.nDirs / 5) + 64);
+    }
+    CloseHandle(h);
+}
+static void TrimVol(Vol& v) {
+    if (v.recs.capacity() > v.recs.size() + v.recs.size() / 20) v.recs.shrink_to_fit();
+    if (v.dirs.capacity() > v.dirs.size() + v.dirs.size() / 20) v.dirs.shrink_to_fit();
+    v.nameBlob.shrink_to_fit();
+    v.lowerBlob.shrink_to_fit();
+}
+
 static void WalkVolume(wchar_t letter, Vol& v, std::stop_token st) {
     v.letter = letter;
     std::wstring root;
@@ -458,12 +479,14 @@ static void ReloadIndexFromCache() {
 // 单卷重扫：WalkVolume 构建 → 原子写盘 → 可见时切内存快照并通知 UI 重搜。
 static void RescanVolume(wchar_t letter, int idx, std::stop_token st) {
     std::lock_guard<std::mutex> lk(g_rescanMu);   // C6：同一时刻只允许一个卷在重扫
+    std::wstring idxPath = CacheDir() + L"\\vol_" + letter + L".idx";
     auto v = std::make_shared<Vol>();
+    ReserveFromIdx(idxPath, *v);
     WalkVolume(letter, *v, st);
     if (st.stop_requested()) return;
+    TrimVol(*v);
     FILETIME f{}; GetSystemTimeAsFileTime(&f);
     uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
-    std::wstring idxPath = CacheDir() + L"\\vol_" + letter + L".idx";
     std::wstring tmp = idxPath + L".tmp";
     if (SaveVol(tmp, *v, buildTime)) {
         bool moved = false;
@@ -647,8 +670,10 @@ static void IndexerThread(std::stop_token st) {
             if (have && bt > 0 && now - bt < STARTUP_STALE_TICKS) continue;
             // rebuild
             auto v = std::make_shared<Vol>();
+            ReserveFromIdx(idxPath, *v);
             WalkVolume(letter, *v, st);
             if (st.stop_requested()) return;
+            TrimVol(*v);
             FILETIME f{}; GetSystemTimeAsFileTime(&f);
             uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
             std::wstring tmp = idxPath + L".tmp";
