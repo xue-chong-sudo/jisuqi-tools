@@ -27,6 +27,7 @@
 #include <io.h>
 #include <chrono>
 #include <timezoneapi.h>
+#include <psapi.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -36,6 +37,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "psapi.lib")
 
 // ============================================================
 // 0. basics
@@ -53,6 +55,8 @@ enum : UINT {
     WM_APP_SEARCHDONE = WM_APP + 1,
     WM_APP_INDEXSTAT  = WM_APP + 2,
     WM_APP_COMMITTED  = WM_APP + 3,
+    WM_APP_EXIT        = WM_APP + 101,   // 主程序/右键菜单 → 显式退出
+    WM_APP_RESCAN_DONE = WM_APP + 102,   // 调度线程重扫完成 → UI 重跑当前查询
 };
 
 // ---------------- colors ----------------
@@ -190,6 +194,21 @@ struct Vol {
 };
 using Snapshot = std::vector<std::shared_ptr<Vol>>;
 static std::atomic<std::shared_ptr<Snapshot>> g_snap{ std::make_shared<Snapshot>() };
+
+// ---- Phase1：常驻 / 监听 / 调度 状态 ----
+static std::atomic<bool> g_visible{ true };          // 窗口是否可见（隐藏期才施加最小重扫间隔）
+static std::mutex        g_listenMu;
+static HANDLE            g_listenHandle[26] = {};    // 监听线程真实句柄（CancelSynchronousIo 用）
+static HANDLE            g_listenThreadH[26] = {};   // CreateThread 句柄（join 用）
+static std::mutex        g_rescanMu;                 // C6：全局串行化重扫（IndexerThread + 调度线程）
+static const DWORD       DEBOUNCE_MS = 8000;
+static const uint64_t    HIDDEN_MIN_INTERVAL_MS = 5ull * 60 * 1000;
+struct VolWatch {
+    std::atomic<bool>     dirty{ false };
+    std::atomic<uint64_t> dirtyTimeMs{ 0 };
+    std::atomic<uint64_t> lastRescanMs{ 0 };
+};
+static VolWatch g_volWatch[26];
 static const size_t MAX_STORED = 100000;
 
 // ---------------- string helpers ----------------
@@ -336,7 +355,10 @@ static bool LoadVol(const std::wstring& path, Vol& v, uint64_t& buildTime) {
 }
 
 // ---------------- indexer thread ----------------
+static std::mutex g_statusMu;
 static std::wstring g_indexStatus;
+static void SetIndexStatus(std::wstring s) { std::lock_guard<std::mutex> lk(g_statusMu); g_indexStatus = std::move(s); }
+static std::wstring GetIndexStatus() { std::lock_guard<std::mutex> lk(g_statusMu); return g_indexStatus; }
 static std::wstring GetExeDir() {
     wchar_t buf[MAX_PATH + 2] = {};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -404,11 +426,167 @@ static void WalkVolume(wchar_t letter, Vol& v, std::stop_token st) {
             if (++count % 20000 == 0) {
                 wchar_t b[80];
                 swprintf(b, 80, L"正在建立索引：%c: (%llu 个文件)", (wchar_t)letter, (unsigned long long)count);
-                g_indexStatus = b;
+                SetIndexStatus(b);
             }
         } while (FindNextFileW(h, &fd) && !st.stop_requested());
         FindClose(h);
     }
+}
+
+// ---------------- Phase1：监听 / 调度 / 重扫 ----------------
+
+// 从磁盘缓存重载全部固定盘索引（隐藏时快照已置空，窗口重新显示时调用）。
+static void ReloadIndexFromCache() {
+    auto ns = std::make_shared<Snapshot>();
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(drives & (1u << i))) continue;
+        wchar_t letter = (wchar_t)('A' + i);
+        wchar_t root[4] = { letter, L':', L'\\', 0 };
+        if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        std::wstring idxPath = CacheDir() + L"\\vol_" + letter + L".idx";
+        auto v = std::make_shared<Vol>();
+        uint64_t bt = 0;
+        if (LoadVol(idxPath, *v, bt)) ns->push_back(v);
+    }
+    std::sort(ns->begin(), ns->end(), [](auto& a, auto& b) { return a->letter < b->letter; });
+    g_snap.store(ns);
+}
+
+// 单卷重扫：WalkVolume 构建 → 原子写盘 → 可见时切内存快照并通知 UI 重搜。
+static void RescanVolume(wchar_t letter, int idx, std::stop_token st) {
+    std::lock_guard<std::mutex> lk(g_rescanMu);   // C6：同一时刻只允许一个卷在重扫
+    auto v = std::make_shared<Vol>();
+    WalkVolume(letter, *v, st);
+    if (st.stop_requested()) return;
+    FILETIME f{}; GetSystemTimeAsFileTime(&f);
+    uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
+    std::wstring idxPath = CacheDir() + L"\\vol_" + letter + L".idx";
+    std::wstring tmp = idxPath + L".tmp";
+    if (SaveVol(tmp, *v, buildTime)) {
+        bool moved = false;
+        for (int a = 0; a < 3 && !moved; ++a) {
+            if (a) Sleep(200);
+            moved = MoveFileExW(tmp.c_str(), idxPath.c_str(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        }
+    }
+    if (g_visible.load()) {
+        CommitVol(v);                                   // 原子快照替换（复用已有 CommitVol）
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_RESCAN_DONE, 0, 0);
+    }
+    // 隐藏期：v 作用域结束即释放，不常驻
+}
+
+// 每盘一个同步监听线程：只标脏，绝不在此重扫。
+static DWORD WINAPI ListenerProc(LPVOID param) {
+    int idx = (int)(INT_PTR)param;
+    wchar_t letter = (wchar_t)('A' + idx);
+    wchar_t root[4] = { letter, L':', L'\\', 0 };
+    HANDLE self = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &self, THREAD_TERMINATE, FALSE, 0)) self = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_listenMu);
+        g_listenHandle[idx] = self;
+    }
+    HANDLE hDir = CreateFileW(root, FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (hDir != INVALID_HANDLE_VALUE) {
+        // 忽略本程序自身 data 目录（idx/config 写入）造成的变更，否则"写 idx → 触发重扫 → 再写 idx"会死循环。
+        std::wstring ignore;
+        {
+            std::wstring data = DataRoot();
+            if (data.size() >= 3 && towupper(data[0]) == towupper(letter) && data[1] == L':') {
+                ignore = data.substr(3);
+                for (auto& c : ignore) c = (wchar_t)towlower(c);
+            }
+        }
+        std::vector<BYTE> buf(64 * 1024);
+        for (;;) {
+            DWORD bytes = 0;
+            BOOL ok = ReadDirectoryChangesW(hDir, buf.data(), (DWORD)buf.size(), TRUE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                &bytes, nullptr, nullptr);
+            if (!ok) {
+                DWORD err = GetLastError();
+                if (err == ERROR_OPERATION_ABORTED) break;   // 被 CancelSynchronousIo 打断
+                g_volWatch[idx].dirty = true;                // 其他错误：标脏后退出，由调度兜底
+                g_volWatch[idx].dirtyTimeMs = GetTickCount64();
+                break;
+            }
+            bool any = false;
+            if (bytes == 0) {
+                any = true;                                  // 溢出：无法判断路径，保守标脏
+            } else {
+                BYTE* p = buf.data();
+                for (;;) {
+                    auto* fni = (FILE_NOTIFY_INFORMATION*)p;
+                    std::wstring path(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
+                    for (auto& c : path) c = (wchar_t)towlower(c);
+                    if (ignore.empty() || path.rfind(ignore, 0) != 0) { any = true; break; }
+                    if (fni->NextEntryOffset == 0) break;
+                    p += fni->NextEntryOffset;
+                }
+            }
+            if (any) {
+                g_volWatch[idx].dirty = true;
+                g_volWatch[idx].dirtyTimeMs = GetTickCount64();
+            }
+        }
+        CloseHandle(hDir);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_listenMu);
+        if (g_listenHandle[idx] == self) g_listenHandle[idx] = nullptr;
+    }
+    if (self) CloseHandle(self);
+    return 0;
+}
+
+// 全局唯一调度线程：防抖后串行重扫；隐藏期加最小间隔，可见期不加。
+static void SchedulerThread(std::stop_token st) {
+    while (!st.stop_requested()) {
+        uint64_t now = GetTickCount64();
+        DWORD drives = GetLogicalDrives();
+        for (int i = 0; i < 26; i++) {
+            if (st.stop_requested()) return;
+            if (!(drives & (1u << i))) continue;
+            wchar_t letter = (wchar_t)('A' + i);
+            wchar_t root[4] = { letter, L':', L'\\', 0 };
+            if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+            auto& vs = g_volWatch[i];
+            if (!vs.dirty.load()) continue;
+            if (now - vs.dirtyTimeMs.load() < DEBOUNCE_MS) continue;
+            bool vis = g_visible.load();
+            if (!vis && (now - vs.lastRescanMs.load() < HIDDEN_MIN_INTERVAL_MS)) continue;
+            vs.dirty = false;
+            vs.lastRescanMs = now;
+            RescanVolume(letter, i, st);
+        }
+        for (int k = 0; k < 5 && !st.stop_requested(); k++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// 显式退出：停监听（CancelSynchronousIo）→ join → DestroyWindow（→WM_DESTROY→PostQuitMessage）
+static void BeginExit(HWND h) {
+    {
+        std::lock_guard<std::mutex> lk(g_listenMu);
+        for (int i = 0; i < 26; i++)
+            if (g_listenHandle[i]) CancelSynchronousIo(g_listenHandle[i]);
+    }
+    for (int i = 0; i < 26; i++) {
+        if (g_listenThreadH[i]) {
+            WaitForSingleObject(g_listenThreadH[i], 3000);
+            CloseHandle(g_listenThreadH[i]);
+            g_listenThreadH[i] = nullptr;
+        }
+    }
+    SaveConfig();
+    DestroyWindow(h);
 }
 
 // 手动刷新（状态栏「刷新」按钮 / F5）：删掉所有卷的 idx 缓存，再让索引线程
@@ -448,6 +626,7 @@ static void IndexerThread(std::stop_token st) {
             wchar_t letter = (wchar_t)('A' + i);
             wchar_t root[4] = { letter, L':', L'\\', 0 };
             if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+            std::lock_guard<std::mutex> rl(g_rescanMu);   // C6：与调度线程串行化
             // load existing?
             std::wstring idxPath = CacheDir() + L"\\vol_" + letter + L".idx";
             uint64_t bt = 0;
@@ -479,23 +658,23 @@ static void IndexerThread(std::stop_token st) {
                 }
             }
             CommitVol(v);
-            g_indexStatus = L"索引已更新：" + std::wstring(1, letter) + L":";
+            SetIndexStatus(L"索引已更新：" + std::wstring(1, letter) + L":");
             if (g_curEpoch > 0) RequestSearch();   // re-run with fresh data
         }
-        g_indexStatus = L"索引已就绪";
+        SetIndexStatus(L"索引已就绪");
 
         // 等待下一次「手动刷新」或退出；若长时间无操作，30 分钟自动后台刷新一次
         //（长开程序也能自动更新，无需手动点刷新）。
         std::unique_lock<std::mutex> lk(g_refreshMu);
-        g_refreshCv.wait_for(lk, std::chrono::minutes(30),
-            [&] { return g_refreshSeq != mySeq || st.stop_requested(); });
+        // 周期重扫已交给 SchedulerThread；此处只等「手动刷新」或退出。
+        g_refreshCv.wait(lk, [&] { return g_refreshSeq != mySeq || st.stop_requested(); });
         if (st.stop_requested()) return;
     }
 }
 
 // UI 线程调用：清缓存 + 通知索引线程重扫（按钮和 F5 都走这里）
 static void DoRefresh() {
-    g_indexStatus = L"正在刷新索引…";
+    SetIndexStatus(L"正在刷新索引…");
     ClearIndexCache();
     {
         std::lock_guard<std::mutex> lk(g_refreshMu);
@@ -1548,7 +1727,7 @@ static void PaintAll() {
     DrawTextRC(m, g_statusL, lt, C_SUB, g_fSmall);
     // 右侧：索引状态 + 「刷新」按钮（按钮在最右，状态文字让位给它）
     RECT rt = gL.status; rt.right = gL.refresh.left - S(10); rt.left = gL.status.right - S(400);
-    DrawTextRC(m, g_indexStatus, rt, C_SUB, g_fSmall, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+    DrawTextRC(m, GetIndexStatus(), rt, C_SUB, g_fSmall, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
     if (gL.refresh.right > gL.refresh.left) {
         const bool hov = (g_hoverZone == Z_REFRESH);
         HBRUSH bg = CreateSolidBrush(hov ? RGB(0xE5, 0xF4, 0xFD) : RGB(0xFF, 0xFF, 0xFF));
@@ -2236,6 +2415,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
         ShowWindow(h, SW_SHOW);
         SetForegroundWindow(h);
+        g_visible = true;
+        if (g_snap.load()->empty()) ReloadIndexFromCache();   // 隐藏时已释放，重新载入
         if (g_edit) SetFocus(g_edit);
         return 0;
     }
@@ -2612,6 +2793,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (pt.x == -1 && pt.y == -1) return 0;
         POINT cp = pt; ScreenToClient(h, &cp);
         int z = ZoneAt(cp.x, cp.y);
+        if (z == Z_CLOSE) {                       // D4：关闭按钮右键 → 退出菜单
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"退出");
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(m);
+            if (cmd == 1) PostMessageW(h, WM_APP_EXIT, 0, 0);
+            return 0;
+        }
         if (z != Z_LIST) return 0;
         int idx = RowAt(cp.y);
         if (idx < 0) return 0;
@@ -2658,6 +2847,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
+    case WM_APP_RESCAN_DONE:
+        if (g_curEpoch) DoSearch();   // 可见期重扫完成 → 用新快照重跑当前查询
+        return 0;
+    case WM_APP_EXIT:
+        BeginExit(h);
+        return 0;
     case WM_APP_INDEXSTAT:
         InvalidateRect(h, &gL.status, FALSE);
         return 0;
@@ -2669,9 +2864,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                      SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
-    case WM_CLOSE:
-        DestroyWindow(h);
+    case WM_CLOSE: {
+        // 关窗=隐藏，不退出；但必须真释放索引/结果（否则 ~130MB 不归还）。
+        g_visible = false;
+        g_curEpoch = ++g_epoch;                      // 丢弃在飞结果（代次隔离）
+        g_results.clear();     g_results.shrink_to_fit();
+        g_view.clear();        g_view.shrink_to_fit();
+        g_resultKeys.clear();  g_resultKeys.shrink_to_fit();
+        g_totalFound = 0;
+        memset(g_catCount, 0, sizeof g_catCount);
+        g_sel = -1; g_scroll = 0;
+        g_snap.store(std::make_shared<Snapshot>());  // 释放整份索引（搜索线程若在飞，结束后自然释放）
+        SaveConfig();
+        EmptyWorkingSet(GetCurrentProcess());        // 降工作集；大 vector 已析构降 Private
+        ShowWindow(h, SW_HIDE);
         return 0;
+    }
     case WM_DESTROY:
         if (g_memDc) {
             if (g_memOldBmp) SelectObject(g_memDc, g_memOldBmp);
@@ -2679,6 +2887,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (g_memBmp) { DeleteObject(g_memBmp); g_memBmp = nullptr; }
         SaveConfig();
+        g_visible = false;
         g_hwnd = nullptr;
         PostQuitMessage(0);
         return 0;
@@ -2787,6 +2996,19 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     std::jthread indexer([](std::stop_token st) { IndexerThread(st); });
     std::jthread searcher([](std::stop_token st) { SearcherThread(st); });
     std::jthread pump([](std::stop_token st) { IndexStatusPump(st); });
+    std::jthread scheduler([](std::stop_token st) { SchedulerThread(st); });
+    // 每个固定盘一个监听线程（同步 RDCW，只标脏）
+    {
+        DWORD drives = GetLogicalDrives();
+        for (int i = 0; i < 26; i++) {
+            if (!(drives & (1u << i))) continue;
+            wchar_t letter = (wchar_t)('A' + i);
+            wchar_t root[4] = { letter, L':', L'\\', 0 };
+            if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+            HANDLE th = CreateThread(nullptr, 0, ListenerProc, (LPVOID)(INT_PTR)i, 0, nullptr);
+            if (th) g_listenThreadH[i] = th;
+        }
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -2813,6 +3035,20 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     indexer.request_stop(); g_refreshCv.notify_all();
     searcher.request_stop(); g_reqCv.notify_all();
     pump.request_stop();
+    scheduler.request_stop();
+    // 兜底：确保监听线程退出并回收句柄（正常路径已由 BeginExit 处理）
+    {
+        std::lock_guard<std::mutex> lk(g_listenMu);
+        for (int i = 0; i < 26; i++)
+            if (g_listenHandle[i]) CancelSynchronousIo(g_listenHandle[i]);
+    }
+    for (int i = 0; i < 26; i++) {
+        if (g_listenThreadH[i]) {
+            WaitForSingleObject(g_listenThreadH[i], 3000);
+            CloseHandle(g_listenThreadH[i]);
+            g_listenThreadH[i] = nullptr;
+        }
+    }
     // drain pending app messages (free payloads)
     MSG m2;
     while (PeekMessageW(&m2, nullptr, WM_APP, WM_APP + 20, PM_REMOVE)) {
