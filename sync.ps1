@@ -1,11 +1,12 @@
-# sync.ps1 —— 极速启工具集 · 一键双备份同步
+﻿# sync.ps1 —— 极速启工具集 · 一键双备份同步
 # 作用：把本机 main 分支的提交依次推送到 Gitee 与 GitHub 两个私有仓库。
 # 入口：双击「同步到云端.bat」（它会用 -ExecutionPolicy Bypass 调用本文件）。
 #
 # 安全约定：
 #   - 全程不出现任何令牌明文；推送认证由 Windows 凭据管理器（credential.helper=manager）自动完成。
 #   - 绝不强制推送（--force）。检测到未提交改动时直接停止并提示。
-#   - Gitee 走直连（显式清空代理）；GitHub 走系统默认代理（国内偶尔 502，带重试）。
+#   - Gitee 走直连（显式清空代理）；GitHub 自动探测本机可用代理端口（代理软件端口会变，
+#     不再写死某个端口），逐个尝试，最后再试直连；国内偶尔 502，带重试。
 
 $ErrorActionPreference = 'Continue'
 
@@ -76,11 +77,39 @@ function Push-Remote($remote, $branch, $maxTry, $gitArgs) {
     return $false
 }
 
-# Gitee：直连稳定，重试 2 次；GitHub：国内网络偶尔 502，重试 4 次
-# Gitee 显式清空 http(s).proxy 强制直连；GitHub 沿用系统代理（如有）。
+# Gitee：直连稳定，重试 2 次（显式清空代理）。
 $giteeArgs = @('-c', 'http.proxy=', '-c', 'https.proxy=', '-c', 'http.sslBackend=openssl')
 $giteeOk = Push-Remote "gitee"  "main" 2 $giteeArgs
-$ghOk    = Push-Remote "origin" "main" 4 @()
+
+# GitHub：国内网络通常需代理，且代理端口随代理软件变化 → 自动探测本机可用代理端口。
+function Test-LocalPort($port, $ms = 400) {
+    try {
+        $c = New-Object Net.Sockets.TcpClient
+        $t = $c.ConnectAsync('127.0.0.1', $port)
+        if ($t.Wait($ms) -and $c.Connected) { $c.Close(); return $true }
+        $c.Close()
+    } catch {}
+    return $false
+}
+$sysProxy  = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue).ProxyServer
+$candPorts = @(13910, 11275, 7897, 7890, 10809, 10808, 8899, 1080)
+if ($sysProxy -match ':(\d+)') { $candPorts = @([int]$matches[1]) + $candPorts }
+$livePorts = $candPorts | Select-Object -Unique | Where-Object { Test-LocalPort $_ }
+
+$ghOk = $false
+foreach ($port in $livePorts) {
+    $px = "http://127.0.0.1:$port"
+    Write-Host "  尝试 GitHub 代理: $px" -ForegroundColor DarkGray
+    if (Push-Remote "origin" "main" 2 @('-c', "http.proxy=$px", '-c', "https.proxy=$px")) {
+        $ghOk = $true
+        Write-Host "  GitHub 经代理 $px 推送成功" -ForegroundColor Green
+        break
+    }
+}
+if (-not $ghOk) {
+    Write-Host "  未找到可用代理，尝试 GitHub 直连…" -ForegroundColor DarkGray
+    $ghOk = Push-Remote "origin" "main" 2 @('-c', 'http.proxy=', '-c', 'https.proxy=')
+}
 
 Banner "同步结果"
 if ($giteeOk) { Write-Host "  Gitee  : ✓ 成功   https://gitee.com/xue-chong-sudo/jisuqi-tools"      -ForegroundColor Green } `
