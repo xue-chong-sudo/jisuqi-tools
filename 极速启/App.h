@@ -52,6 +52,9 @@ public:
     // 低层鼠标钩子看门狗：重装 WH_MOUSE_LL（系统可能因超时静默移除，导致鼠标呼出失效）。
     void ReinstallMouseHook();
 
+    // 呼出键当前是否仍按住（供长按计时到点判定，替代不可靠的 GetAsyncKeyState）。
+    bool IsMouseHeld();
+
     Config& GetConfig() { return m_config; }
     IconManager& GetIconManager() { return m_iconManager; }
     MainWindow& GetMainWindow() { return m_mainWindow; }

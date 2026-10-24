@@ -16,7 +16,8 @@
 // 设置数据结构（与 settings_ui.cpp 中的 static Settings g_s 保持一致）。
 // 默认值即“开箱即用”的合理值。
 struct Settings {
-    bool    rememberSize = true;   // 记住窗口尺寸
+    bool    rememberSize = true;   // （保留兼容）窗口尺寸现在始终记住，此开关不再影响尺寸
+    bool    followMouse = false;   // 窗口跟随鼠标：true=面板中心落在鼠标处；false=上次拖动位置
     bool    middleButton = true;   // （已废弃，恒为 true）旧“鼠标中键呼出”开关，由 mouseBtn/holdMs 取代
     int     mouseBtn = 0;          // 呼出鼠标键：0=中键, 1=向后侧键(XBUTTON1), 2=向前侧键(XBUTTON2), 3=不使用鼠标呼出
     int     holdMs = 0;            // 长按毫秒：0=按下即触发；125/250/375/500=长按该时长才触发

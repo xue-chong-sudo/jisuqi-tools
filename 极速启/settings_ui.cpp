@@ -102,6 +102,7 @@ static int ParseIntClamped(const wchar_t* s, int def, int lo, int hi) {
 static void Load() {
     std::wstring f = IniPath();
     g_s.rememberSize = GetPrivateProfileIntW(L"window", L"remember", 1, f.c_str()) != 0;
+    g_s.followMouse  = GetPrivateProfileIntW(L"window", L"followmouse", 0, f.c_str()) != 0;
     g_s.middleButton = true;   // 旧开关已由“鼠标按键弹出”下拉框替代，鼠标呼出常开
     g_s.hkMod        = GetPrivateProfileIntW(L"hotkey",  L"mod",     0, f.c_str());
     g_s.hkVk         = GetPrivateProfileIntW(L"hotkey",  L"vk",      0, f.c_str());
@@ -184,6 +185,7 @@ static void Load() {
 static void Save() {
     std::wstring f = IniPath(); wchar_t b[32];
     WritePrivateProfileStringW(L"window", L"remember", g_s.rememberSize ? L"1" : L"0", f.c_str());
+    WritePrivateProfileStringW(L"window", L"followmouse", g_s.followMouse ? L"1" : L"0", f.c_str());
     WritePrivateProfileStringW(L"window", L"autostart", g_s.autoStart ? L"1" : L"0", f.c_str());
     WritePrivateProfileStringW(L"hotkey", L"middle",   g_s.middleButton ? L"1" : L"0", f.c_str());
     swprintf(b, 32, L"%u", g_s.hkMod);  WritePrivateProfileStringW(L"hotkey", L"mod",  b, f.c_str());
@@ -858,7 +860,7 @@ static void PaintClient(HDC hdc) {
         // ---- 启动页 ----
         DrawSection(g, 68,  L"常规");
         Txt(g, L"开机自启", *F13, C_TEXT, RectF(24, 96, 110, 30), false);
-        Txt(g, L"记住窗口尺寸", *F13, C_TEXT, RectF(214, 96, 130, 30), false);
+        Txt(g, L"窗口跟随鼠标", *F13, C_TEXT, RectF(214, 96, 130, 30), false);
 
         DrawSection(g, 144, L"呼出方式");
         Txt(g, L"设置鼠标键弹出", *F13, C_TEXT, RectF(24, 174, 210, 30), false);
@@ -956,7 +958,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g.Clear(C_WHITE);
         bool hot = (d->itemState & ODS_HOTLIGHT) != 0;
         switch (d->CtlID) {
-        case ID_TG1:   DrawToggle(g, rc, g_s.rememberSize); break;
+        case ID_TG1:   DrawToggle(g, rc, g_s.followMouse); break;
         case ID_TG_AUTO: DrawToggle(g, rc, g_s.autoStart); break;
         case ID_HOT:   DrawHotRow(g, rc, hot, 0); break;
         case ID_HOT_SHOT: DrawHotRow(g, rc, hot, 1); break;
@@ -1003,7 +1005,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (hHot0) InvalidateRect(hHot0, nullptr, FALSE);
         }
         switch (ctl) {
-        case ID_TG1:  g_s.rememberSize = !g_s.rememberSize; PersistCtrl(hwnd, ID_TG1); return 0;
+        case ID_TG1:  g_s.followMouse = !g_s.followMouse; PersistCtrl(hwnd, ID_TG1); return 0;
         case ID_TG_AUTO: g_s.autoStart = !g_s.autoStart; PersistCtrl(hwnd, ID_TG_AUTO); return 0;
         case ID_HOT:
             // 录键：只取键盘焦点，不 SetCapture。

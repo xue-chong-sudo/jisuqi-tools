@@ -66,6 +66,7 @@ LRESULT CALLBACK MouseHook::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM l
         const MSLLHOOKSTRUCT* d = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         int hold = GetSettings().holdMs;    // 每次事件都读最新设置，保存后立即生效
         if (IsButtonDown(wParam, d)) {
+            g_instance->m_held = true;
             if (hold <= 0) {
                 // 按下即触发（默认）。低层钩子是全局的，即使别的软件占用了
                 // RegisterHotKey 呼出键，这里照样能呼出。
@@ -79,6 +80,7 @@ LRESULT CALLBACK MouseHook::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM l
             return 1;
         }
         if (IsButtonUp(wParam, d)) {
+            g_instance->m_held = false;
             if (hold > 0) KillTimer(g_instance->m_hWnd, TIMER_MOUSEHOLD);
             // 抬起同样吞掉，避免其他应用收到"凭空"的抬起。
             return 1;

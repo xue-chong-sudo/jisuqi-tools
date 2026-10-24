@@ -520,7 +520,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             // memory is disabled).
             Config& cfg = m_app->GetConfig();
             RECT r;
-            bool restore = GetSettings().rememberSize && cfg.winW > 0;
+            bool restore = cfg.winW > 0;   // 尺寸始终记住上次大小（rememberSize 开关已弃用，改作「窗口跟随鼠标」）
             if (restore) {
                 r.left = cfg.winX; r.top = cfg.winY;
                 r.right = cfg.winX + cfg.winW; r.bottom = cfg.winY + cfg.winH;
@@ -1183,18 +1183,33 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             // menu commands are not swallowed.
             {
                 int id = LOWORD(wp);
-                const Config& cfg = m_app->GetConfig();
+                Config& c = m_app->GetConfig();
                 int gi = id - ID_CTX_MOVETO_BASE;
-                if (id >= ID_CTX_MOVETO_BASE &&
-                    gi >= 0 && gi < static_cast<int>(cfg.groups.size()) &&
-                    m_selected >= 0 &&
-                    m_selected < static_cast<int>(m_visible.size())) {
-                    Config& c = m_app->GetConfig();
-                    c.items[m_visible[m_selected]].group = c.groups[gi];
-                    c.Save();
-                    RebuildVisible();
-                    InvalidateGrid();
-                    return 0;
+                if (id >= ID_CTX_MOVETO_BASE && gi >= 0 && gi < static_cast<int>(c.groups.size())) {
+                    // 抽屉成员：移出抽屉 → 变成该分组下的顶层图标
+                    if (m_openDrawer >= 0 && m_selectedMember >= 0 &&
+                        m_openDrawer < static_cast<int>(c.items.size())) {
+                        Item& d = c.items[m_openDrawer];
+                        if (m_selectedMember < static_cast<int>(d.members.size())) {
+                            Item mv = d.members[m_selectedMember];
+                            mv.group = c.groups[gi];
+                            d.members.erase(d.members.begin() + m_selectedMember);
+                            c.items.push_back(mv);
+                            c.Save();
+                            m_selectedMember = -1;
+                            RebuildVisible();
+                            InvalidateGrid();
+                        }
+                        return 0;
+                    }
+                    // 顶层图标：改分组
+                    if (m_selected >= 0 && m_selected < static_cast<int>(m_visible.size())) {
+                        c.items[m_visible[m_selected]].group = c.groups[gi];
+                        c.Save();
+                        RebuildVisible();
+                        InvalidateGrid();
+                        return 0;
+                    }
                 }
             }
             // 图标字母快捷键：弹窗输入单个 A-Z
@@ -1406,13 +1421,10 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_ICONDBL) { ClearIconDblState(); }   // 面板双击门控兜底：第二击未到则复位
             if (wp == TIMER_MOUSEHOLD) {   // 鼠标长按计时到点：按键仍被按住才触发呼出
                 KillTimer(m_hwnd, TIMER_MOUSEHOLD);
-                int b = GetSettings().mouseBtn;
-                if (b >= 0 && b <= 2) {      // b==3 表示不使用鼠标呼出
-                    UINT vk = VK_MBUTTON;
-                    if (b == 1) vk = VK_XBUTTON1; else if (b == 2) vk = VK_XBUTTON2;
-                    if (GetAsyncKeyState(vk) & 0x8000)
-                        PostMessageW(m_hwnd, WM_APP_TOGGLE, 0, 0);
-                }
+                // 用钩子自维护的按下状态判定（GetAsyncKeyState 对侧键 XBUTTON1/2 不可靠，
+                // 正是"长按呼出失效"的根因）。
+                if (m_app->IsMouseHeld())
+                    PostMessageW(m_hwnd, WM_APP_TOGGLE, 0, 0);
             }
             if (wp == TIMER_HOOKCHECK) { m_app->ReinstallMouseHook(); }  // 鼠标钩子看门狗：定期重装自愈
             if (wp == TIMER_TOPMOST) {   // 置顶看门狗：面板可见但置顶样式丢失时自动补回
@@ -2231,6 +2243,24 @@ void MainWindow::Show() {
 
     ShowWindow(m_hwnd, SW_SHOW);
 
+    // 「窗口跟随鼠标」：开启时每次呼出把面板中心放到鼠标位置（并夹在显示器工作区内）；
+    // 关闭时保持原位置（窗口不销毁，即上次拖动的位置）。
+    if (GetSettings().followMouse) {
+        RECT wr; GetWindowRect(m_hwnd, &wr);
+        int w = wr.right - wr.left, h = wr.bottom - wr.top;
+        POINT cp; GetCursorPos(&cp);
+        int nx = cp.x - w / 2, ny = cp.y - h / 2;
+        HMONITOR mon = MonitorFromPoint(cp, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (mon && GetMonitorInfoW(mon, &mi)) {
+            if (nx < mi.rcWork.left) nx = mi.rcWork.left;
+            if (ny < mi.rcWork.top) ny = mi.rcWork.top;
+            if (nx + w > mi.rcWork.right) nx = mi.rcWork.right - w;
+            if (ny + h > mi.rcWork.bottom) ny = mi.rcWork.bottom - h;
+        }
+        SetWindowPos(m_hwnd, nullptr, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     // ② 每次呼出都抬到最顶层（HWND_TOPMOST 同时会把窗口排到置顶组的顶端）。
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
@@ -2783,14 +2813,21 @@ void MainWindow::DropInternalDrag(POINT pt) {
             int dv = DrawerCellAt(pt);
             if (dv >= 0 && (size_t)dv < m_visible.size() && m_visible[dv] != srcCfg) {
                 // (a) drop onto a drawer cell -> move into the drawer.
-                // Push into the drawer FIRST (members vector is independent of
-                // the outer items indices), THEN erase the source so dCfg
-                // stays valid (Bug 2).
                 size_t dCfg = m_visible[dv];
                 Item src = cfg.items[srcCfg];
-                cfg.items[dCfg].members.push_back(src);
-                cfg.items.erase(cfg.items.begin() + srcCfg);
-                changed = true;
+                // 限制1：抽屉不能放进抽屉（禁止套娃）。
+                // 限制2：目标抽屉已有同一图标（同路径+同类型）→ 不重复添加（否则会复制出快捷键冲突的副本）。
+                bool dup = false;
+                for (const auto& m : cfg.items[dCfg].members)
+                    if (m.path == src.path && m.type == src.type) { dup = true; break; }
+                if (!src.isDrawer && !dup) {
+                    // Push into the drawer FIRST (members vector is independent of
+                    // the outer items indices), THEN erase the source so dCfg
+                    // stays valid (Bug 2).
+                    cfg.items[dCfg].members.push_back(src);
+                    cfg.items.erase(cfg.items.begin() + srcCfg);
+                    changed = true;
+                }
             } else {
                 bool cross = (gi >= 0) || (m_dragOverTab >= 0) ||
                              (origGroup != cfg.currentGroup);
@@ -2852,10 +2889,16 @@ void MainWindow::DropInternalDrag(POINT pt) {
                         cfg.items[srcDrawer].members.insert(
                             cfg.items[srcDrawer].members.begin() + srcMem, src);
                     } else {
-                        cfg.items[srcDrawer].members.erase(
-                            cfg.items[srcDrawer].members.begin() + srcMem);
-                        cfg.items[dCfg].members.push_back(src);
-                        changed = true;
+                        // 去重：目标抽屉已有同一图标（同路径+同类型）则不重复加入，源保持不动。
+                        bool dup = false;
+                        for (const auto& m : cfg.items[dCfg].members)
+                            if (m.path == src.path && m.type == src.type) { dup = true; break; }
+                        if (!dup) {
+                            cfg.items[srcDrawer].members.erase(
+                                cfg.items[srcDrawer].members.begin() + srcMem);
+                            cfg.items[dCfg].members.push_back(src);
+                            changed = true;
+                        }
                     }
                 } else {
                     cfg.items[srcDrawer].members.erase(
@@ -3031,9 +3074,26 @@ void MainWindow::ShowMemberMenu(int mi, POINT pt) {    m_selectedMember = mi;
     HMENU h = CreatePopupMenu();
     g_menuText.clear();
     g_menuDpi = m_dpi;
+    // 与抽屉外图标菜单保持一致，仅少「新建抽屉」（抽屉内不能再建抽屉）。
     AddMenuText(h, ID_CTX_RENAME, L"重命名", L"F2");
-    AddMenuText(h, ID_CTX_DELETE, L"删除图标", L"D");
     AddMenuText(h, ID_CTX_OPENLOC, L"打开目录", L"G");
+    AddMenuText(h, ID_CTX_DELETE, L"删除图标", L"D");
+    // 「移动分组」：把该成员移出抽屉，成为指定分组下的顶层图标
+    {
+        const Config& cfg = m_app->GetConfig();
+        if (!cfg.groups.empty()) {
+            HMENU hSub = CreatePopupMenu();
+            for (int gi = 0; gi < static_cast<int>(cfg.groups.size()); ++gi)
+                AddMenuText(hSub, ID_CTX_MOVETO_BASE + gi, cfg.groups[gi]);
+            if (GetMenuItemCount(hSub) > 0)
+                AddMenuText(h, reinterpret_cast<UINT_PTR>(hSub), L"移动分组",
+                            std::wstring(), true, 0, /*sysPopup=*/true);
+            else
+                DestroyMenu(hSub);
+        }
+    }
+    AddMenuText(h, ID_CTX_CHANGEICON, L"更换图标");
+    AddMenuText(h, ID_CTX_SHORTCUT_SET, L"设置快捷键");
     SetForegroundWindow(m_hwnd);
     ClientToScreen(m_hwnd, &pt);
     g_menuKind = 3;   // member menu shortcuts (F2 / D / G)

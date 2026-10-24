@@ -21,6 +21,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <unordered_set>
 #include <deque>
 #include <cstdio>
 #include <chrono>
@@ -253,6 +254,7 @@ struct IdxHead {
 static const char IDX_MAGIC[8] = { 'W','B','S','V','O','L','1','\0' };
 static const uint64_t REFRESH_INTERVAL = 6ull * 3600 * 10000000; // 6h in FILETIME ticks(100ns)=6h*36e8? use filetime compare below
 static const uint64_t SIX_HOURS_TICKS = 6ull * 3600 * 1000 * 10000; // 6h * 10^7
+static const uint64_t STARTUP_STALE_TICKS = 10ull * 60 * 1000 * 10000; // 10 分钟：启动时缓存超过此龄就后台重扫
 
 static bool SaveVol(const std::wstring& path, const Vol& v, uint64_t buildTime) {
     FILE* f = nullptr;
@@ -444,10 +446,10 @@ static void IndexerThread(std::stop_token st) {
                 FILETIME f{}; GetSystemTimeAsFileTime(&f);
                 now = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
             }
-            if (have && bt > 0 && now - bt < SIX_HOURS_TICKS) {
-                CommitVol(loaded);
-                continue;
-            }
+            // 先用缓存立即出结果（即便略旧），避免"启动空白等扫描"。
+            if (have) CommitVol(loaded);
+            // 缓存足够新（10 分钟内）就不重扫；否则后台重扫刷新（用户无需手动刷新）。
+            if (have && bt > 0 && now - bt < STARTUP_STALE_TICKS) continue;
             // rebuild
             auto v = std::make_shared<Vol>();
             WalkVolume(letter, *v, st);
@@ -462,9 +464,11 @@ static void IndexerThread(std::stop_token st) {
         }
         g_indexStatus = L"索引已就绪";
 
-        // 挂起等待下一次「刷新」（或退出）
+        // 等待下一次「手动刷新」或退出；若长时间无操作，30 分钟自动后台刷新一次
+        //（长开程序也能自动更新，无需手动点刷新）。
         std::unique_lock<std::mutex> lk(g_refreshMu);
-        g_refreshCv.wait(lk, [&] { return g_refreshSeq != mySeq || st.stop_requested(); });
+        g_refreshCv.wait_for(lk, std::chrono::minutes(30),
+            [&] { return g_refreshSeq != mySeq || st.stop_requested(); });
         if (st.stop_requested()) return;
     }
 }
@@ -609,6 +613,7 @@ static int  g_curCat = CAT_ALL;
 // 格式筛选（第四轮需求4/5）：按"具体扩展名"筛选。空 = 不过滤（等效全选）。
 // 勾选状态跨"重开下拉/切换分类/重新搜索"记忆；切换分类后下拉只列该分类下实际存在的格式
 static std::vector<std::wstring> g_typeSel;
+static std::vector<std::wstring> g_resultKeys;   // 与 g_results 平行的扩展名 key 缓存（筛选勾满卡顿优化）
 // 结果条目的格式 key：文件夹 → "文件夹"；无扩展名 → "(无扩展名)"；其余 → 大写扩展名
 static std::wstring ExtKeyOf(const Res& r) {
     if (r.cat == CAT_DIR) return L"文件夹";
@@ -903,17 +908,23 @@ static void SortResults() {
     out.reserve(n);
     for (size_t i = 0; i < n; ++i) out.push_back(std::move(g_results[(size_t)order[i]]));
     g_results.swap(out);
+    g_resultKeys.clear();   // 结果集已变，扩展名缓存失效
 }
 static void RebuildView() {
     g_view.clear();
     g_view.reserve(g_results.size());
+    // 扩展名 key 缓存：结果集变化后惰性重建一次，避免每次勾选筛选都全量重算扩展名
+    //（勾满格式时卡顿的主因）。g_resultKeys 与 g_results 同步清空。
+    if (g_resultKeys.size() != g_results.size()) {
+        g_resultKeys.resize(g_results.size());
+        for (size_t i = 0; i < g_results.size(); ++i) g_resultKeys[i] = ExtKeyOf(g_results[i]);
+    }
+    // 选中格式用集合做 O(1) 命中，去掉每结果 O(|sel|) 的线性扫描。
+    std::unordered_set<std::wstring> selSet(g_typeSel.begin(), g_typeSel.end());
+    const bool hasSel = !selSet.empty();
     for (size_t i = 0; i < g_results.size(); i++) {
         // 左侧分类 + 文件名列头的格式筛选（第四轮需求4/5：按具体扩展名）；空 = 不过滤
-        bool typeOk = g_typeSel.empty();
-        if (!typeOk) {
-            std::wstring k = ExtKeyOf(g_results[i]);
-            for (const auto& s : g_typeSel) if (s == k) { typeOk = true; break; }
-        }
+        bool typeOk = !hasSel || (selSet.find(g_resultKeys[i]) != selSet.end());
         if ((g_curCat == CAT_ALL || g_results[i].cat == g_curCat) && typeOk)
             g_view.push_back((int)i);
     }
@@ -2610,6 +2621,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         DoneMsg* m = (DoneMsg*)lp;
         if (m->epoch == g_curEpoch) {
             g_results = std::move(*m->items);
+            g_resultKeys.clear();   // 结果集已变，扩展名缓存失效
             g_totalFound = m->total;
             // 需求12：角标与列表严格同源——从"实际保存的结果"重新统计，
             // 超过 MAX_STORED 时全量数字只出现在状态栏说明里，避免对不上
