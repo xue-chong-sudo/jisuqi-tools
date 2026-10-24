@@ -13,6 +13,7 @@
 #include <string>
 #include <utility>   // std::move
 #include <mutex>
+#include <atomic>
 #include <functional>
 #include "text_join.h"   // 智能换行：textjoin::JoinLines
 #include <gdiplus.h>     // 标注与工具栏的抗锯齿绘制（wWinMain 已 GdiplusStartup）
@@ -94,6 +95,7 @@ struct VState {
 };
 VState g;
 std::mutex g_wordsMutex; // 保护 g.words：窗口线程读，OCR 工作线程写
+static std::atomic<int> g_resultGen{0}; // 结果代次：新截图递增，旧 OCR 回调据此丢弃
 static int g_exitMode = 0;           // 退出方式：0=复制后直接退出（默认），1=复制后 ESC 退出
 
 // 把 RGB(top-down) 图像构建成 24bpp bottom-up BGR 的 DIB section（只做一次）。
@@ -1510,13 +1512,18 @@ std::string FormatSelection(const std::vector<OcrWord>& words, NewlineMode mode)
 }
 
 void ShowResultAndCopy(CaptureImage img) {
-    WaitAsyncOcr(); // 上一轮 OCR 必须先结束，才能重置全局状态
-    if (g.hSrc) { DeleteObject(g.hSrc); g.hSrc = nullptr; }
-    g = VState{};
-    g.img = std::move(img);
-    g.ocrPending = true;
-    g.s = 1.0; // 默认 1:1
-    g.hSrc = BuildSourceDIB(g.img.width, g.img.height, g.img.rgb);
+    // 不再等待上一轮 OCR（旧实现会卡到上一轮识别结束，连续截图要等 ~10 秒）。
+    // 先递增代次：旧 OCR 回调即使抢到锁也会因代次不符被丢弃，绝不污染新一轮状态。
+    const int myGen = ++g_resultGen;
+    {
+        std::lock_guard<std::mutex> lk(g_wordsMutex);   // 与 OCR 回调互斥，安全重置
+        if (g.hSrc) { DeleteObject(g.hSrc); g.hSrc = nullptr; }
+        g = VState{};
+        g.img = std::move(img);
+        g.ocrPending = true;
+        g.s = 1.0; // 默认 1:1
+        g.hSrc = BuildSourceDIB(g.img.width, g.img.height, g.img.rgb);
+    }
     // 弹出图片的同时把原图写入剪贴板（CF_DIB）：截图即所得，随后复制文字时
     // 会覆盖为文字。与“直接截图”模式共用同一个写剪贴板实现。
     CopyImageToClipboard(g.img);
@@ -1568,8 +1575,10 @@ void ShowResultAndCopy(CaptureImage img) {
     // 标注工具栏：独立小工具窗（微信风格），外挂在结果窗口右下角外
     TbCreate();
     // 先显示图片；OCR 放到后台线程，完成后回填词表并刷新（高亮那时才可用）
-    OcrImageAsync(g.img, [](std::vector<OcrWord> words) {
-        { std::lock_guard<std::mutex> lk(g_wordsMutex); g.words = std::move(words); }
+    OcrImageAsync(g.img, [myGen](std::vector<OcrWord> words) {
+        std::lock_guard<std::mutex> lk(g_wordsMutex);
+        if (myGen != g_resultGen.load()) return;   // 旧一代结果，丢弃
+        g.words = std::move(words);
         g.ocrPending = false;
         if (g.hwnd) PostMessageW(g.hwnd, WM_APP + 1, 0, 0);
     });

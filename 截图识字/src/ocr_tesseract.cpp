@@ -6,6 +6,8 @@
 #include <thread>      // 后台 OCR
 #include <functional>
 #include <algorithm>
+#include <mutex>              // 工作线程任务槽
+#include <condition_variable>
 
 // OCR 引擎：用 unique_ptr + 自定义删除器管理生命周期，避免全局裸指针与重复
 // 初始化导致的泄漏。删除器负责 End() + delete（与旧 OcrShutdown 等价）。
@@ -128,10 +130,16 @@ std::vector<OcrWord> OcrImage(const CaptureImage& img) {
     std::vector<OcrWord> res;
     if (!g_ocr || img.rgb.empty()) return res;
 
-    // 预处理：把小字号截图整体放大 kOcrUpscale 倍，放大后送 OCR，识别率更稳。
-    // 放大后的词框坐标需再除以倍数，映射回原图像素空间（否则高亮会错位）。
-    std::vector<unsigned char> rgbCopy = UpscaleRGB(img.rgb, img.width, img.height, kOcrUpscale);
-    int ow = img.width * kOcrUpscale, oh = img.height * kOcrUpscale;
+    // 预处理：小字号截图整体放大以提升识别率；但**大图不再 2x**——
+    // 放大后像素数按平方增长，LSTM 在数百万像素上会慢到数秒（连续截图会卡）。
+    // 规则：放大后总像素不超过约 250 万，超出则降为 1x；放大倍数同时用于把词框坐标缩回原图。
+    int up = kOcrUpscale;
+    {
+        const long long px = (long long)img.width * img.height;
+        while (up > 1 && px * (long long)up * up > 2500000LL) --up;
+    }
+    std::vector<unsigned char> rgbCopy = UpscaleRGB(img.rgb, img.width, img.height, up);
+    int ow = img.width * up, oh = img.height * up;
     g_ocr->SetImage(rgbCopy.data(), ow, oh, 3, ow * 3);
     g_ocr->SetSourceResolution(300);          // 提升小字号识别率
     g_ocr->SetPageSegMode(kOcrPsm);
@@ -139,7 +147,7 @@ std::vector<OcrWord> OcrImage(const CaptureImage& img) {
 
     tesseract::ResultIterator* ri = g_ocr->GetIterator();
     if (!ri) return res;
-    const int inv = kOcrUpscale; // 盒坐标缩回原图
+    const int inv = up; // 盒坐标缩回原图
     do {
         char* txt = ri->GetUTF8Text(tesseract::RIL_WORD);
         int l, t, r, b;
@@ -166,23 +174,59 @@ std::vector<OcrWord> OcrImage(const CaptureImage& img) {
 }
 
 // ------------------------------------------------------------------
-// 后台 OCR：结果窗口先显示原图，识别在工作线程进行（UI 不再等 OCR）
+// 后台 OCR：常驻工作线程 + 「最新优先」任务槽。
+//   - 绝不在 UI 线程上 join 上一轮 OCR（旧实现那样会让连续截图卡到上一轮识别结束）；
+//   - 新任务覆盖尚未开始的旧任务；正在跑的那一轮无法中断，跑完其结果由调用方按代次丢弃；
+//   - 单一引擎，工作线程串行使用，无需额外锁。
 // ------------------------------------------------------------------
-static std::thread g_asyncOcr;
+struct OcrJob {
+    CaptureImage img;
+    std::function<void(std::vector<OcrWord>)> cb;
+};
+static std::mutex              g_jobMu;
+static std::condition_variable g_jobCv;
+static std::shared_ptr<OcrJob> g_pending;
+static bool                    g_stop = false;
+static std::thread             g_worker;
+static std::once_flag          g_workerOnce;
+
+static void OcrWorkerLoop() {
+    for (;;) {
+        std::shared_ptr<OcrJob> job;
+        {
+            std::unique_lock<std::mutex> lk(g_jobMu);
+            g_jobCv.wait(lk, [] { return g_stop || g_pending != nullptr; });
+            if (g_stop && !g_pending) return;
+            job = std::move(g_pending);
+            g_pending.reset();
+        }
+        if (job) {
+            std::vector<OcrWord> words = OcrImage(job->img);
+            if (job->cb) job->cb(std::move(words));
+        }
+    }
+}
 
 void OcrImageAsync(const CaptureImage& img,
                    std::function<void(std::vector<OcrWord>)> onDone) {
-    // 安全收尾：如果上一轮 OCR 线程仍未结束（理论上 WaitAsyncOcr 已处理，
-    // 但防御性 join 可避免 std::thread 析构时 terminate）。
-    if (g_asyncOcr.joinable()) g_asyncOcr.join();
-    // 启动线程前同步复制一份像素（线程生命周期可能长于调用方持有的图像）
-    auto copy = std::make_shared<CaptureImage>(img);
-    g_asyncOcr = std::thread([copy, onDone = std::move(onDone)]() {
-        std::vector<OcrWord> words = OcrImage(*copy);
-        if (onDone) onDone(std::move(words));
-    });
+    std::call_once(g_workerOnce, [] { g_worker = std::thread(OcrWorkerLoop); });
+    auto job = std::make_shared<OcrJob>();
+    job->img = img;               // 复制一份像素，线程生命周期独立于调用方
+    job->cb  = std::move(onDone);
+    {
+        std::lock_guard<std::mutex> lk(g_jobMu);
+        g_pending = std::move(job);   // 覆盖尚未开始的旧任务（最新优先）
+    }
+    g_jobCv.notify_one();
 }
 
 void WaitAsyncOcr() {
-    if (g_asyncOcr.joinable()) g_asyncOcr.join();
+    // 仅用于程序退出：停止工作线程并等待当前任务结束。
+    {
+        std::lock_guard<std::mutex> lk(g_jobMu);
+        g_stop = true;
+        g_pending.reset();
+    }
+    g_jobCv.notify_all();
+    if (g_worker.joinable()) g_worker.join();
 }
