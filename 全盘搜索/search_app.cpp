@@ -202,6 +202,7 @@ static HANDLE            g_listenHandle[26] = {};    // 监听线程真实句柄
 static HANDLE            g_listenThreadH[26] = {};   // CreateThread 句柄（join 用）
 static std::mutex        g_rescanMu;                 // C6：全局串行化重扫（IndexerThread + 调度线程）
 static const DWORD       DEBOUNCE_MS = 8000;
+static const uint64_t    VISIBLE_MIN_INTERVAL_MS = 30ull * 1000;   // 可见期下限，防高频改名/建删把重扫打成死循环
 static const uint64_t    HIDDEN_MIN_INTERVAL_MS = 5ull * 60 * 1000;
 struct VolWatch {
     std::atomic<bool>     dirty{ false };
@@ -507,8 +508,9 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
         for (;;) {
             DWORD bytes = 0;
             BOOL ok = ReadDirectoryChangesW(hDir, buf.data(), (DWORD)buf.size(), TRUE,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                // 只关心"增/删/改名"；不监听 SIZE/LAST_WRITE——浏览器等会持续写已有文件，
+                // 若监听内容写入会导致"写文件→整卷重扫→再写→再扫"永远停不下来。
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                 &bytes, nullptr, nullptr);
             if (!ok) {
                 DWORD err = GetLastError();
@@ -561,7 +563,8 @@ static void SchedulerThread(std::stop_token st) {
             if (!vs.dirty.load()) continue;
             if (now - vs.dirtyTimeMs.load() < DEBOUNCE_MS) continue;
             bool vis = g_visible.load();
-            if (!vis && (now - vs.lastRescanMs.load() < HIDDEN_MIN_INTERVAL_MS)) continue;
+            uint64_t floorMs = vis ? VISIBLE_MIN_INTERVAL_MS : HIDDEN_MIN_INTERVAL_MS;
+            if (now - vs.lastRescanMs.load() < floorMs) continue;
             vs.dirty = false;
             vs.lastRescanMs = now;
             RescanVolume(letter, i, st);
@@ -2414,6 +2417,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (g_wmActivate && msg == g_wmActivate) {
         if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
         ShowWindow(h, SW_SHOW);
+        UpdateWindow(h);                       // 先重画再交互，避免隐藏→显示时的透明闪烁
         SetForegroundWindow(h);
         g_visible = true;
         if (g_snap.load()->empty()) ReloadIndexFromCache();   // 隐藏时已释放，重新载入
@@ -2973,12 +2977,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
         y = wa.top + ((wa.bottom - wa.top) - hh) / 2;
     }
     HWND hwnd = CreateWindowExW(0, L"JisuqiFullDiskSearch", L"极速启 · 全盘文件搜索",
-                                WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,   // 需求11：WS_CLIPCHILDREN 防子控件闪烁
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,   // 先不 WS_VISIBLE：首帧画完再显示，避免“搜索框透明/穿透”闪烁
                                 x, y, w, hh, nullptr, nullptr, hi, nullptr);
     if (!hwnd) return 1;
-    // 启动即把焦点放到搜索框（Ctrl+F 呼出后可直接输入，无需再按一次或点一下）
-    SetForegroundWindow(hwnd);
-    SetFocus(g_edit);
     // force non-client recalc so the custom (borderless) frame applies immediately
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -2991,6 +2992,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
             ApplyRoundRegion();
         }
     }
+    // 先完成布局与首帧绘制，再显示窗口，并从任务栏恢复时同样先重画，消除初始透明。
+    ShowWindow(hwnd, g_wp.showCmd ? g_wp.showCmd : SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(g_edit);
 
     // threads
     std::jthread indexer([](std::stop_token st) { IndexerThread(st); });
