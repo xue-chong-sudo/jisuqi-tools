@@ -2681,7 +2681,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"JisuqiFullDiskSearch";
     wc.hIcon = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(101), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;   // CS_DBLCLKS：必须，否则收不到 WM_LBUTTONDBLCLK（双击打开失效）
     RegisterClassW(&wc);
 
     // default window size: large, centered, remember if config present
