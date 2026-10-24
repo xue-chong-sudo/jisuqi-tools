@@ -81,20 +81,29 @@ function Push-Remote($remote, $branch, $maxTry, $gitArgs) {
 $giteeArgs = @('-c', 'http.proxy=', '-c', 'https.proxy=', '-c', 'http.sslBackend=openssl')
 $giteeOk = Push-Remote "gitee"  "main" 2 $giteeArgs
 
-# GitHub：国内网络通常需代理，且代理端口随代理软件变化 → 自动探测本机可用代理端口。
-function Test-LocalPort($port, $ms = 400) {
+# GitHub：国内网络通常需代理，且代理端口随代理软件变化（每次启动可能不同）→
+# 自动探测本机可用代理：先试常见端口，找不到再扫描全部监听端口（2 秒超时实测）。
+function Test-Proxy($port) {
     try {
-        $c = New-Object Net.Sockets.TcpClient
-        $t = $c.ConnectAsync('127.0.0.1', $port)
-        if ($t.Wait($ms) -and $c.Connected) { $c.Close(); return $true }
-        $c.Close()
-    } catch {}
-    return $false
+        $r = Invoke-WebRequest -Uri 'https://github.com' -Proxy "http://127.0.0.1:$port" `
+             -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        return ($r.StatusCode -eq 200)
+    } catch { return $false }
 }
-$sysProxy  = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue).ProxyServer
-$candPorts = @(13910, 11275, 7897, 7890, 10809, 10808, 8899, 1080)
-if ($sysProxy -match ':(\d+)') { $candPorts = @([int]$matches[1]) + $candPorts }
-$livePorts = $candPorts | Select-Object -Unique | Where-Object { Test-LocalPort $_ }
+$ProgressPreference = 'SilentlyContinue'
+$sysProxy = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue).ProxyServer
+$common   = @(13910, 11275, 7897, 7890, 10809, 10808, 8899, 1080)
+if ($sysProxy -match ':(\d+)') { $common = @([int]$matches[1]) + $common }
+$livePorts = @()
+foreach ($pt in ($common | Select-Object -Unique)) { if (Test-Proxy $pt) { $livePorts += $pt; break } }
+if ($livePorts.Count -eq 0) {
+    Write-Host "  常见端口无可用代理，扫描本机监听端口..." -ForegroundColor DarkGray
+    $listen = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+              Where-Object { $_.LocalAddress -in '127.0.0.1','0.0.0.0','::' } |
+              Select-Object -ExpandProperty LocalPort -Unique |
+              Where-Object { $_ -gt 1024 -and $_ -lt 65000 -and $common -notcontains $_ }
+    foreach ($pt in $listen) { if (Test-Proxy $pt) { $livePorts += $pt; break } }
+}
 
 $ghOk = $false
 foreach ($port in $livePorts) {
