@@ -49,6 +49,9 @@ public:
     // 启动/唤起 search\全盘搜索.exe，并按「开启预览」传入 --preview=0/1。
     void LaunchSearch();
 
+    // 低层鼠标钩子看门狗：重装 WH_MOUSE_LL（系统可能因超时静默移除，导致鼠标呼出失效）。
+    void ReinstallMouseHook();
+
     Config& GetConfig() { return m_config; }
     IconManager& GetIconManager() { return m_iconManager; }
     MainWindow& GetMainWindow() { return m_mainWindow; }

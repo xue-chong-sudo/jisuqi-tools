@@ -1414,6 +1414,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                         PostMessageW(m_hwnd, WM_APP_TOGGLE, 0, 0);
                 }
             }
+            if (wp == TIMER_HOOKCHECK) { m_app->ReinstallMouseHook(); }  // 鼠标钩子看门狗：定期重装自愈
             if (wp == TIMER_TOPMOST) {   // 置顶看门狗：面板可见但置顶样式丢失时自动补回
                 if (IsWindowVisible(m_hwnd) &&
                     !(GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) {

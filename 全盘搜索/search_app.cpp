@@ -41,6 +41,8 @@
 static HINSTANCE g_inst = nullptr;
 static HWND g_hwnd = nullptr;
 static HWND g_edit = nullptr;
+static UINT   g_wmActivate = 0;        // RegisterWindowMessage：单实例唤醒（叫到最前并聚焦搜索框）
+static HANDLE g_singleMtx  = nullptr;  // 单实例互斥量（进程生命周期内保持打开）
 static HWND g_pop = nullptr;      // scope popup
 static int  g_dpi = 96;
 static int  S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -1586,6 +1588,7 @@ static void ClampScroll() {
 static void SelectCat(int pos) {
     int id = g_catOrder[pos];
     g_curCat = id;
+    g_typeSel.clear();          // 切换分类清空格式筛选记忆（回到默认「全不勾=不过滤」）
     RebuildView();
     UpdateStatusText();
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -1959,6 +1962,9 @@ static void TypeMenuToggle(const std::wstring& key) {
     auto it = std::find(g_typeSel.begin(), g_typeSel.end(), key);
     if (it != g_typeSel.end()) g_typeSel.erase(it);
     else g_typeSel.push_back(key);
+    // Windows 式筛选语义：所有格式都被勾选 == 不过滤（等效全选）→ 归一为「全不勾」，
+    // 避免出现「逐项全勾」与「全不勾」两种等价但显示不同的冗余状态。
+    if (!g_tmList.empty() && g_typeSel.size() >= g_tmList.size()) g_typeSel.clear();
     RebuildView();
     UpdateStatusText();
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -2161,8 +2167,6 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PT
 // 第7条需求：搜索框里直接输一个已存在的路径，回车就打开它（文件夹用资源
 // 管理器打开，文件用默认程序打开）。不是路径就返回 false，照常搜索。
     case WM_KEYDOWN:
-        // F5 = 刷新索引（手动重建），和状态栏那颗按钮等价
-        if (wp == VK_F5) { DoRefresh(); return 0; }
         // 需求1（第四轮）：回车 = 打开选中项；没有选中结果时才触发搜索
         if (wp == VK_RETURN) {
             KillTimer(g_hwnd, 1);
@@ -2196,6 +2200,14 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PT
 
 // main wndproc
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    // 单实例唤醒：另一进程发现已有实例后 PostMessage 本消息 → 把窗口叫到最前并聚焦搜索框。
+    if (g_wmActivate && msg == g_wmActivate) {
+        if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+        ShowWindow(h, SW_SHOW);
+        SetForegroundWindow(h);
+        if (g_edit) SetFocus(g_edit);
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE: {
         g_hwnd = h;
@@ -2656,6 +2668,21 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX icc{ sizeof icc, ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
+    // 单实例：已在运行时把已有窗口叫到最前并聚焦搜索框，本次直接退出，避免重复开窗。
+    g_wmActivate = RegisterWindowMessageW(L"JisuqiSearchActivate");
+    g_singleMtx = CreateMutexW(nullptr, TRUE, L"JisuqiSearch_SingleInstance");
+    if (g_singleMtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"JisuqiFullDiskSearch", nullptr);
+        if (existing) {
+            if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
+            ShowWindow(existing, SW_SHOW);
+            SetForegroundWindow(existing);
+            if (g_wmActivate) PostMessageW(existing, g_wmActivate, 0, 0);
+        }
+        CloseHandle(g_singleMtx);
+        return 0;
+    }
+
     // 解析主程序传入的数据目录：--datadir="<path>"
     // 未传（独立运行）时退回默认 <exeDir>\data，保持向后兼容。
     {
@@ -2705,6 +2732,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,   // 需求11：WS_CLIPCHILDREN 防子控件闪烁
                                 x, y, w, hh, nullptr, nullptr, hi, nullptr);
     if (!hwnd) return 1;
+    // 启动即把焦点放到搜索框（Ctrl+F 呼出后可直接输入，无需再按一次或点一下）
+    SetForegroundWindow(hwnd);
+    SetFocus(g_edit);
     // force non-client recalc so the custom (borderless) frame applies immediately
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);

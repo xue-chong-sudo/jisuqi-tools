@@ -130,6 +130,9 @@ bool App::Init(HINSTANCE hInst) {
     m_tray.Create(m_mainWindow.GetHwnd(), icon, L"极速启");
 
     m_hook.Install(m_mainWindow.GetHwnd());
+    // 低层鼠标钩子看门狗：WH_MOUSE_LL 可能被系统因回调超时静默移除（导致鼠标呼出"突然失效"），
+    // 定期重装以自愈（每 30 秒一次，重装开销极小）。
+    SetTimer(m_mainWindow.GetHwnd(), TIMER_HOOKCHECK, 30000, nullptr);
     ApplySettings();       // (re)apply hotkey / auto-start before showing
     // 预热截图识字宿主：在后台提前加载 OCR 引擎，避免「每次首次触发截图」时
     // 因 OCR 初始化（约 1~3 秒）而卡住。宿主为常驻隐藏进程，预热后每次触发即秒开。
@@ -357,6 +360,11 @@ void App::AddRecycleBin() {
     cfg.items.push_back(it);
     cfg.Save();
     m_mainWindow.OnItemsChanged();
+}
+
+void App::ReinstallMouseHook() {
+    // Install 内部会先卸掉旧钩子再重装，等价于安全重装；钩子健在时重装也无副作用。
+    m_hook.Install(m_mainWindow.GetHwnd());
 }
 
 // ---------------------------------------------------------------------------

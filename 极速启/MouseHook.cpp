@@ -40,8 +40,13 @@ static bool IsButtonUp(WPARAM msg, const MSLLHOOKSTRUCT* d) {
 bool MouseHook::Install(HWND hWnd) {
     m_hWnd = hWnd;
     g_instance = this;
-    m_hook = SetWindowsHookExW(WH_MOUSE_LL, &MouseHook::LowLevelMouseProc,
-                               GetModuleHandleW(nullptr), 0);
+    if (m_hook) { UnhookWindowsHookEx(m_hook); m_hook = nullptr; }  // 支持安全重装
+    // WH_MOUSE_LL 的钩子过程在当前进程内：hMod 传 NULL（MSDN 推荐）；
+    // 失败再退回 exe 模块句柄，兼容个别环境。任一成功即可。
+    m_hook = SetWindowsHookExW(WH_MOUSE_LL, &MouseHook::LowLevelMouseProc, nullptr, 0);
+    if (!m_hook)
+        m_hook = SetWindowsHookExW(WH_MOUSE_LL, &MouseHook::LowLevelMouseProc,
+                                   GetModuleHandleW(nullptr), 0);
     return m_hook != nullptr;
 }
 

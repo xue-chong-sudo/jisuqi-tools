@@ -65,5 +65,6 @@
 #define TIMER_MOUSEHOLD         4   // 鼠标长按计时（MouseHook 启动、WM_TIMER 处理）
 #define TIMER_TOPMOST           5   // 置顶看门狗
 #define TIMER_ICONDBL           6   // 面板图标单击/双击启动门控（仅兜底清理用，非主判据）
+#define TIMER_HOOKCHECK         7   // 低层鼠标钩子看门狗：定期重装，防止被系统超时静默移除
 
 #endif // BONNY_RESOURCE_H
