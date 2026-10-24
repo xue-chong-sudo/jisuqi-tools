@@ -617,6 +617,8 @@ static std::wstring ExtKeyOf(const Res& r) {
     return e;
 }
 static int  g_sel = -1;                    // index into g_view
+static int  g_dblRow = -1;                 // 手动双击检测：上一次左键按下命中行号
+static DWORD g_dblTime = 0;                // 手动双击检测：上一次左键按下的消息时间
 static int  g_scroll = 0;                  // first visible row
 static std::wstring g_statusL, g_statusR;
 static bool g_searching = false;
@@ -2474,24 +2476,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (z == Z_LIST) {
             int idx = RowAt(y);
             if (idx >= 0 && idx != g_sel) { g_sel = idx; InvalidateRect(h, nullptr, FALSE); }
+            // 手动双击检测：不依赖 WM_LBUTTONDBLCLK / CS_DBLCLKS（某些环境下该消息不生成，
+            // 导致双击被拆成两次普通点击、只选中不打开）。改为在第二次 WM_LBUTTONDOWN 时
+            // 判断「与上一次同属一行且间隔 < 系统双击时限」即视为双击。
+            if (idx >= 0) {
+                DWORD now = GetMessageTime();
+                DWORD dct = GetDoubleClickTime(); if (dct == 0) dct = 500;
+                if (g_dblRow == idx && (DWORD)(now - g_dblTime) < dct) {
+                    if (const Res* r = SelectedRes()) OpenItem(*r, ColAt(x) == 1);
+                    g_dblRow = -1; g_dblTime = 0;   // 清状态，防连锁/重复触发
+                } else {
+                    g_dblRow = idx; g_dblTime = now;
+                }
+            }
             return 0;
         }
         if (z == Z_CHK) { g_subfolders = !g_subfolders; SaveConfig(); InvalidateRect(h, nullptr, FALSE); return 0; }
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int z = ZoneAt(pt.x, pt.y);
-        if (z == Z_LIST) {
-            const Res* r = SelectedRes();
-            if (r) {
-                // 需求2（第四轮）：以"文件名|所在路径"分隔线为界——
-                // 双击文件名列 = 打开文件；双击所在路径列 = 打开目录
-                int col = ColAt(pt.x);
-                if (col == 1) OpenItem(*r, true);
-                else          OpenItem(*r, false);
-            }
-        }
+        // 双击打开逻辑已迁移到 WM_LBUTTONDOWN(Z_LIST) 的手动双击检测（不依赖 CS_DBLCLKS）。
+        // 移除 CS_DBLCLKS 后系统不再生成此消息，保留空 case 无害。
         return 0;
     }
     case WM_LBUTTONUP: {
@@ -2681,7 +2686,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"JisuqiFullDiskSearch";
     wc.hIcon = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(101), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;   // CS_DBLCLKS：必须，否则收不到 WM_LBUTTONDBLCLK（双击打开失效）
+    wc.style = CS_HREDRAW | CS_VREDRAW;   // 不含 CS_DBLCLKS：双击改由 WM_LBUTTONDOWN 手动检测，避免该消息在某些环境下不生成导致双击失效
     RegisterClassW(&wc);
 
     // default window size: large, centered, remember if config present
