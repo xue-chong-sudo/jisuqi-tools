@@ -113,7 +113,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Deps D:\bt\tess
 ## 换台电脑怎么恢复
 
 ```powershell
-git clone https://github.com/xue-chong-sudo/jisuqi-tools.git
+# 优先从 Gitee 克隆（国内更快更稳），也可改从 GitHub 克隆，二者内容一致
+git clone https://gitee.com/xue-chong-sudo/jisuqi-tools.git
 cd jisuqi-tools
 # 然后进各自子目录编译
 powershell -ExecutionPolicy Bypass -File .\极速启\build.ps1
@@ -125,6 +126,49 @@ powershell -ExecutionPolicy Bypass -File .\极速启\build.ps1
 - 第三方依赖：`deps\`
 - 用户数据与运行时配置：`data\`、`*.idx`、`config.json`、`settings.ini`、`icons\`、`tessdata\`
 - 临时文件：`*.tmp`、`*.log`
+
+---
+
+## 备份与同步（GitHub + Gitee 双私有仓库）
+
+代码同时保存在两个**私有**仓库，互为备份：
+
+| 平台 | 仓库地址 | 可见性 |
+|---|---|---|
+| GitHub | https://github.com/xue-chong-sudo/jisuqi-tools | 私有 |
+| Gitee  | https://gitee.com/xue-chong-sudo/jisuqi-tools   | 私有 |
+
+两个仓库内容完全一致（同一份 `main` 分支）。任一个平台临时不可达，另一个仍能正常备份与恢复。
+
+### 怎么一键同步
+
+仓库根目录提供两个文件：
+
+- `同步到云端.bat` —— 双击入口（在资源管理器里双击即可）
+- `sync.ps1` —— 实际同步逻辑（由 `.bat` 调用）
+
+双击 `同步到云端.bat` 会：
+
+1. 检查是否有未提交的改动；有就提示并**停止**，绝不强制推送；
+2. 依次 `git push gitee main` 和 `git push origin main`；
+3. 把每个远端的结果（成功 / 失败 + 原因）用中文清楚打印；
+4. 失败时给出可执行的处理建议（例如「GitHub 超时，但 Gitee 已成功，代码已安全」）。
+
+> 认证说明：脚本不含任何令牌明文。推送用的令牌存在 Windows 凭据管理器，由 `credential.helper=manager` 自动取用。换机器或令牌过期后，重新生成私有令牌并用 `git credential approve` 存回即可。
+
+### 换台电脑怎么恢复
+
+从任一平台克隆都能拿到完整源码：
+
+```powershell
+# 方式一：从 Gitee（国内通常更快更稳）
+git clone https://gitee.com/xue-chong-sudo/jisuqi-tools.git
+# 方式二：从 GitHub
+git clone https://github.com/xue-chong-sudo/jisuqi-tools.git
+cd jisuqi-tools
+# 然后进各自子目录编译
+powershell -ExecutionPolicy Bypass -File .\极速启\build.ps1
+```
 
 ---
 
