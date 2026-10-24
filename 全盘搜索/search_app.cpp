@@ -210,7 +210,7 @@ struct VolWatch {
     std::atomic<uint64_t> lastRescanMs{ 0 };
 };
 static VolWatch g_volWatch[26];
-static const size_t MAX_STORED = 100000;
+static const size_t MAX_STORED = 20000;
 
 // ---------------- string helpers ----------------
 static std::wstring U8(const std::string& s) {
@@ -717,10 +717,17 @@ static void RequestSearch() {
 
 // ---------------- search thread ----------------
 struct Res {
-    std::wstring name, dir, sizeStr, timeStr;
+    std::wstring name;
+    std::shared_ptr<Vol> owner;   // 结果持有卷，路径按需解析（不再每条拷一份全路径）
+    uint32_t dirId = 0;
     uint64_t size = 0, mtime = 0;
     uint8_t cat = CAT_OTHER;
 };
+static const std::wstring& ResDir(const Res& r) {
+    static const std::wstring kEmpty;
+    if (!r.owner || r.dirId >= r.owner->dirs.size()) return kEmpty;
+    return r.owner->dirs[r.dirId];
+}
 struct DoneMsg {
     uint64_t epoch;
     std::vector<Res>* items;
@@ -795,9 +802,9 @@ static void SearcherThread(std::stop_token st) {
                     if (done->items->size() >= MAX_STORED) continue;
                     Res it;
                     it.name = U8(std::string(nb + rc.nameOff, rc.nameLen));
-                    it.dir = dd;
+                    it.owner = vol;
+                    it.dirId = rc.parent;
                     it.size = rc.size; it.mtime = rc.mtime;
-                    it.sizeStr = SizeStr(rc.size); it.timeStr = TimeStr(rc.mtime);
                     it.cat = rc.cat;
                     done->items->push_back(std::move(it));
                 }
@@ -1036,8 +1043,11 @@ static int CmpResults(const Res& a, const Res& b) {
     switch (g_sortCol) {
     case 0: c = CompareStringEx(LOCALE_NAME_INVARIANT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
                                 a.name.c_str(), (int)a.name.size(), b.name.c_str(), (int)b.name.size(), nullptr, nullptr, 0) - 2; break;
-    case 1: c = CompareStringEx(LOCALE_NAME_INVARIANT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
-                                a.dir.c_str(), (int)a.dir.size(), b.dir.c_str(), (int)b.dir.size(), nullptr, nullptr, 0) - 2; break;
+    case 1: {
+        const std::wstring& ad = ResDir(a); const std::wstring& bd = ResDir(b);
+        c = CompareStringEx(LOCALE_NAME_INVARIANT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
+                            ad.c_str(), (int)ad.size(), bd.c_str(), (int)bd.size(), nullptr, nullptr, 0) - 2;
+    } break;
     case 2: c = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
     case 3: c = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
     }
@@ -1401,11 +1411,11 @@ static void DrawList(HDC dc) {
         RECT nr{ gL.nameX + S(46), y, gL.nameX + gL.nameW, y + rh };
         DrawTextRC(dc, r.name, nr, sel ? C_BLUE_TXT : C_TEXT, sel ? g_fBold : g_fList);
         RECT pr{ gL.pathX, y, gL.pathX + gL.pathW, y + rh };
-        DrawTextRC(dc, r.dir, pr, C_SUB, g_fList);
+        DrawTextRC(dc, ResDir(r), pr, C_SUB, g_fList);
         RECT sr{ gL.sizeX + S(2), y, gL.sizeX + gL.sizeW, y + rh };
-        DrawTextRC(dc, r.sizeStr, sr, C_TEXT, g_fList, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);   // 需求1：大小靠左
+        DrawTextRC(dc, SizeStr(r.size), sr, C_TEXT, g_fList, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);   // 需求1：大小靠左
         RECT tr{ gL.timeX, y, gL.timeX + gL.timeW, y + rh };
-        DrawTextRC(dc, r.timeStr, tr, C_SUB, g_fList);
+        DrawTextRC(dc, TimeStr(r.mtime), tr, C_SUB, g_fList);
     }
     if (n == 0 && !g_searching) {
         std::wstring hint = g_curEpoch ? L"无匹配结果" : L"输入文件名关键词后回车或点击“搜索”";
@@ -1470,14 +1480,15 @@ static void DrawPreview(HDC dc) {
     RECT pr{ gL.prev.left + S(16), nr.bottom + S(4), gL.prev.right - S(16), nr.bottom + S(4) + S(36) };
     SetTextColor(dc, C_SUB);
     of = (HFONT)SelectObject(dc, g_fSmall);
-    DrawTextW(dc, r.dir.c_str(), -1, &pr, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DrawTextW(dc, ResDir(r).c_str(), -1, &pr, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, of);
     // divider
     int dy = pr.bottom + S(12);
     FillRC(dc, { gL.prev.left + S(16), dy, gL.prev.right - S(16), dy + 1 }, C_SEP);
     // info rows
+    std::wstring szStr = SizeStr(r.size), tmStr = TimeStr(r.mtime);
     struct { const wchar_t* k; const wchar_t* v; } rows[2] = {
-        { L"大小", r.sizeStr.c_str() }, { L"修改时间", r.timeStr.c_str() }
+        { L"大小", szStr.c_str() }, { L"修改时间", tmStr.c_str() }
     };
     int iy = dy + S(14);
     for (auto& row : rows) {
@@ -1833,14 +1844,15 @@ static void SelectCat(int pos) {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 static void OpenItem(const Res& r, bool explore) {
-    std::wstring full = r.dir + L"\\" + r.name;
+    const std::wstring& dir = ResDir(r);
+    std::wstring full = dir + L"\\" + r.name;
     if (explore) {
         if (r.cat == CAT_DIR) {
-            // parent of dir = r.dir itself is dir path; open its parent
-            std::wstring parent = r.dir;
+            // parent of dir = dir itself is dir path; open its parent
+            std::wstring parent = dir;
             size_t p = parent.find_last_of(L'\\');
             if (p != std::wstring::npos && p > 2) parent = parent.substr(0, p);
-            else parent = r.dir;
+            else parent = dir;
             ShellExecuteW(g_hwnd, nullptr, parent.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         } else {
             std::wstring cmd = L"/select,\"" + full + L"\"";
@@ -1853,7 +1865,7 @@ static void OpenItem(const Res& r, bool explore) {
     }
 }
 static void CopyPath(const Res& r) {
-    std::wstring full = r.dir + L"\\" + r.name;
+    std::wstring full = ResDir(r) + L"\\" + r.name;
     if (OpenClipboard(g_hwnd)) {
         EmptyClipboard();
         size_t bytes = (full.size() + 1) * sizeof(wchar_t);
