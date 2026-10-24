@@ -202,7 +202,7 @@ static HANDLE            g_listenHandle[26] = {};    // 监听线程真实句柄
 static HANDLE            g_listenThreadH[26] = {};   // CreateThread 句柄（join 用）
 static std::mutex        g_rescanMu;                 // C6：全局串行化重扫（IndexerThread + 调度线程）
 static const DWORD       DEBOUNCE_MS = 8000;
-static const uint64_t    VISIBLE_MIN_INTERVAL_MS = 30ull * 1000;   // 可见期下限，防高频改名/建删把重扫打成死循环
+static const uint64_t    VISIBLE_MIN_INTERVAL_MS = 5ull * 60 * 1000;   // 可见期也限 5 分钟：C 盘一次扫描约 1 分钟，间隔太短会变成持续扫描
 static const uint64_t    HIDDEN_MIN_INTERVAL_MS = 5ull * 60 * 1000;
 struct VolWatch {
     std::atomic<bool>     dirty{ false };
@@ -275,7 +275,8 @@ struct IdxHead {
 static const char IDX_MAGIC[8] = { 'W','B','S','V','O','L','1','\0' };
 static const uint64_t REFRESH_INTERVAL = 6ull * 3600 * 10000000; // 6h in FILETIME ticks(100ns)=6h*36e8? use filetime compare below
 static const uint64_t SIX_HOURS_TICKS = 6ull * 3600 * 1000 * 10000; // 6h * 10^7
-static const uint64_t STARTUP_STALE_TICKS = 10ull * 60 * 1000 * 10000; // 10 分钟：启动时缓存超过此龄就后台重扫
+// 启动时只有缓存"非常旧"（>24h）才后台重扫；否则先直接用缓存秒出结果，避免每次打开都等 1~2 分钟。
+static const uint64_t STARTUP_STALE_TICKS = 24ull * 60 * 60 * 1000 * 10000; // 24 小时
 
 static bool SaveVol(const std::wstring& path, const Vol& v, uint64_t buildTime) {
     FILE* f = nullptr;
@@ -2871,7 +2872,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: {
         // 关窗=隐藏，不退出；但必须真释放索引/结果（否则 ~130MB 不归还）。
         g_visible = false;
-        g_curEpoch = ++g_epoch;                      // 丢弃在飞结果（代次隔离）
+        ++g_epoch; g_curEpoch = 0;                   // 丢弃在飞结果并复位到“未搜索”
+        if (g_edit) SetWindowTextW(g_edit, L"");     // 清空搜索框，下次打开不残留上次关键词
         g_results.clear();     g_results.shrink_to_fit();
         g_view.clear();        g_view.shrink_to_fit();
         g_resultKeys.clear();  g_resultKeys.shrink_to_fit();
@@ -3023,7 +3025,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
             bool ctrl  = GetKeyState(VK_CONTROL) < 0;
             bool shift = GetKeyState(VK_SHIFT) < 0;
             WPARAM vk  = msg.wParam;
-            if (ctrl && !shift && vk == 'F') {
+            if (!ctrl && !shift && vk == VK_ESCAPE) {
+                PostMessageW(g_hwnd, WM_CLOSE, 0, 0);   // ESC = 关闭（隐藏）窗口
+            } else if (ctrl && !shift && vk == 'F') {
                 SetFocus(g_edit);
             } else if (ctrl && !shift && vk == 'E') {
                 if (const Res* r = SelectedRes()) OpenItem(*r, true);
