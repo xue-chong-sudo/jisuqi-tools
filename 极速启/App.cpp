@@ -403,22 +403,25 @@ void App::LaunchSearch() {
     const ::Settings& s = GetSettings();
     if (!s.searchEnabled) return;
 
-    // 插件随极速启分发在 exe 同级 search\ 目录；兼容直接放在 exe 同级的情况。
-    std::wstring exe = m_config.exeDir + L"\\search\\全盘搜索.exe";
+    // 优先与主程序同目录的 全盘搜索.exe；找不到再回退到 search\ 子目录（兼容旧布局）。
+    std::wstring exe = m_config.exeDir + L"\\全盘搜索.exe";
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wstring alt = m_config.exeDir + L"\\全盘搜索.exe";
+        std::wstring alt = m_config.exeDir + L"\\search\\全盘搜索.exe";
         if (GetFileAttributesW(alt.c_str()) != INVALID_FILE_ATTRIBUTES) exe = alt;
     }
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxW(m_mainWindow.GetHwnd(),
-                    L"未找到 全盘搜索.exe。\n请确认 search 子目录随程序一起分发。",
+                    L"未找到 全盘搜索.exe。\n请确认它随程序一起分发（与主程序同目录或 search 子目录）。",
                     L"极速启", MB_OK | MB_ICONWARNING);
         return;
     }
 
     // 「开启预览」映射为搜索程序的启动参数：--preview=1 显示右侧预览栏，0 隐藏。
+    // --datadir 将搜索插件的数据（config.ini / cache 索引）指向主程序的 data 目录，
+    // 实现主程序与搜索插件共用同一个 data 文件夹，减少部署目录层级。
     // 搜索程序自身是单实例：已在运行时再次启动只会把已有窗口叫到最前（参数不改变已开窗口）。
-    std::wstring cmd = L"\"" + exe + L"\" --preview=" + (s.searchPreview ? L"1" : L"0");
+    std::wstring cmd = L"\"" + exe + L"\" --preview=" + (s.searchPreview ? L"1" : L"0")
+                     + L" --datadir=\"" + m_config.dataDir + L"\"";
     STARTUPINFOW si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,

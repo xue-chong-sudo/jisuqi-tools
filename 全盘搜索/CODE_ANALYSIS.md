@@ -35,7 +35,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 - `CompareStringEx(..., SORT_DIGITSASNUMBERS)` (792 / 807 / 2073)：早期排序实现，已弃用。
 
 ## 5. 部署
-`dist/全盘搜索.exe` 由极速启在 `search/` 子目录调用（部署见 `桌面\极速启\search\全盘搜索.exe`）。
+`dist/全盘搜索.exe` 与极速启主程序**同目录**部署（部署见 `桌面\极速启\全盘搜索.exe`）。
+
+**共享数据目录**：`DataRoot()` 默认 `<exeDir>\data`，但主程序启动时会传 `--datadir="<极速启>\data"` 覆盖它，使搜索的 `config.ini` 与 `cache\` 索引都落在主程序同一个 `data\` 下（避免出现 `search\data` 第二份数据）。独立运行（不带参数）时仍回退到自身 `data\`，保持向后兼容。
 
 ## 6. 已知坑与修复（重要，避免重踩）
 1. **排序错乱**：原 `CmpResults` 返回三态 int(-1/0/1) 被当 `std::stable_sort` 的 bool 谓词（隐式转 true 致非法比较）；`CompareStringEx(SORT_DIGITSASNUMBERS)` 不满足严格弱序的传递性。修复：预计算排序键 + `memcmp` 比较（`search_app.cpp` 290 / 808 / 867 一带）。

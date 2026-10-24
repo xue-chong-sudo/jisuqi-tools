@@ -41,7 +41,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 data\config.json      ← 图标、分组、快捷键
 data\icons\           ← 图标缓存 PNG（文件名 = 原程序文件名）
 data\settings.ini     ← 设置（热键、自动隐藏秒数等）
-search\全盘搜索.exe    ← 内置的“全盘搜索”插件（另一个项目）
+全盘搜索.exe          ← 内置的“全盘搜索”插件（另一个项目，与主程序同目录）
+data\config.ini       ← 搜索窗口 UI 状态（由搜索插件写入，共用同一 data）
+data\cache\           ← 搜索索引缓存（由搜索插件写入，共用同一 data）
 screenshot\截图识字.exe ← 内置的“截图识字”插件（另一个项目）
 ```
 

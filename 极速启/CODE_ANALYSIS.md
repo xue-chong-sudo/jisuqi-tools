@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 ## 7. 部署/运行
 - `dist/极速启.exe` 直接运行；数据在 `dist/data/`。
 - 入口批处理：`启动极速启.bat`、`重置数据.bat`。
-- 搜索插件 `全盘搜索.exe` 与截图插件 `截图识字.exe` 由极速启在 `search/`、`screenshot/` 子目录调用（见部署文件夹 `桌面\极速启\`）。
+- 搜索插件 `全盘搜索.exe` 与主程序**同目录**，截图插件 `截图识字.exe` 在 `screenshot/` 子目录（见部署文件夹 `桌面\极速启\`）。`App::LaunchSearch()` 先找同目录的 `全盘搜索.exe`，找不到再回退 `search/`；并以 `--datadir="<exeDir>\data"` 启动，使搜索配置/索引与主程序共用同一个 `data\`。
 
 ## 8. 依赖
 仅 MSVC + Windows SDK；无第三方二进制依赖（json 为头文件）。

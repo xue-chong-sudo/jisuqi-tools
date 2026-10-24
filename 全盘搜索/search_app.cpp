@@ -328,7 +328,15 @@ static std::wstring GetExeDir() {
     size_t s = p.find_last_of(L'\\');
     return s == std::wstring::npos ? L"." : p.substr(0, s);
 }
-static std::wstring CacheDir() { return GetExeDir() + L"\\data\\cache"; }
+// 数据根目录：默认 <exeDir>\data；可由主程序通过 --datadir= 指定为共享目录（极速启\data），
+// 从而实现「主程序 + 搜索插件」共用同一个 data 文件夹，减少部署时的目录层级。
+static std::wstring g_dataRoot;
+static std::wstring DataRoot() {
+    if (!g_dataRoot.empty()) return g_dataRoot;
+    g_dataRoot = GetExeDir() + L"\\data";
+    return g_dataRoot;
+}
+static std::wstring CacheDir() { return DataRoot() + L"\\cache"; }
 
 static void CommitVol(std::shared_ptr<Vol> v) {
     auto cur = g_snap.load();
@@ -408,7 +416,7 @@ static void ClearIndexCache() {
 
 static void IndexerThread(std::stop_token st) {
     // ensure dirs
-    CreateDirectoryW((GetExeDir() + L"\\data").c_str(), nullptr);
+    CreateDirectoryW(DataRoot().c_str(), nullptr);
     CreateDirectoryW(CacheDir().c_str(), nullptr);
     for (;;) {
         int mySeq;
@@ -721,7 +729,7 @@ static RECT PreviewOpenFRect() {
 // ============================================================
 // 4. config
 // ============================================================
-static std::wstring ConfigPath() { return GetExeDir() + L"\\data\\config.ini"; }
+static std::wstring ConfigPath() { return DataRoot() + L"\\config.ini"; }
 static int CfgInt(const wchar_t* k, int def) {
     return GetPrivateProfileIntW(L"ui", k, def, ConfigPath().c_str());
 }
@@ -2642,6 +2650,28 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
     }
     INITCOMMONCONTROLSEX icc{ sizeof icc, ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
+
+    // 解析主程序传入的数据目录：--datadir="<path>"
+    // 未传（独立运行）时退回默认 <exeDir>\data，保持向后兼容。
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 0; i < argc; i++) {
+                std::wstring a = argv[i];
+                if (a.rfind(L"--datadir=", 0) == 0) {
+                    g_dataRoot = a.substr(10);
+                    if (!g_dataRoot.empty() && g_dataRoot.front() == L'"')
+                        g_dataRoot = g_dataRoot.substr(1);
+                    if (!g_dataRoot.empty() && g_dataRoot.back() == L'"')
+                        g_dataRoot = g_dataRoot.substr(0, g_dataRoot.size() - 1);
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+    }
+
     LoadConfig();
 
     WNDCLASSW wc{};
