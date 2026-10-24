@@ -2885,9 +2885,8 @@ void MainWindow::DropInternalDrag(POINT pt) {
                 if (dv >= 0) {
                     int dCfg = static_cast<int>(m_visible[dv]);
                     if (dCfg == srcDrawer) {
-                        // Dropped back onto its own drawer -> restore in place.
-                        cfg.items[srcDrawer].members.insert(
-                            cfg.items[srcDrawer].members.begin() + srcMem, src);
+                        // 拖回自己抽屉的格子上：数据本就未被移除，保持原状即可。
+                        // （旧代码在这里 insert 了一份副本却不删原件 → 抽屉里出现两个相同图标）
                     } else {
                         // 去重：目标抽屉已有同一图标（同路径+同类型）则不重复加入，源保持不动。
                         bool dup = false;
