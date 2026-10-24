@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <deque>
 #include <cstdio>
+#include <io.h>
 #include <chrono>
 #include <timezoneapi.h>
 
@@ -281,45 +282,56 @@ static bool SaveVol(const std::wstring& path, const Vol& v, uint64_t buildTime) 
         if (fwrite(&nl, 8, 1, f) != 1 || fwrite(v.nameBlob.data(), 1, (size_t)nl, f) != nl ||
             fwrite(&ll, 8, 1, f) != 1 || fwrite(v.lowerBlob.data(), 1, (size_t)ll, f) != ll) ok = false;
     } while (0);
+    // C4：落盘前把 CRT 缓冲刷到内核并 commit，确保随后 MoveFileEx 替换到的是完整文件，
+    // 避免"半截 idx"被读端 LoadVol 读到。
+    if (ok) { fflush(f); _commit(_fileno(f)); }
     fclose(f);
     return ok;
 }
 static bool LoadVol(const std::wstring& path, Vol& v, uint64_t& buildTime) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"rb") || !f) return false;
+    // C5：必须以全共享方式打开。否则同一时刻的原子替换（MoveFileEx 需要目标可删除）
+    // 会因读端持有独占句柄而失败，导致 idx 永远更新不了。
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
     bool ok = false;
+    auto rd = [&](void* p, size_t n) -> bool {
+        DWORD got = 0;
+        return ReadFile(h, p, (DWORD)n, &got, nullptr) && (size_t)got == n;
+    };
     do {
-        IdxHead h{};
-        if (fread(&h, sizeof h, 1, f) != 1) break;
-        if (memcmp(h.magic, IDX_MAGIC, 8) != 0 || h.ver != 1) break;
-        v = Vol{}; v.letter = (wchar_t)h.letter; buildTime = h.buildTime;
+        IdxHead hd{};
+        if (!rd(&hd, sizeof hd)) break;
+        if (memcmp(hd.magic, IDX_MAGIC, 8) != 0 || hd.ver != 1) break;
+        v = Vol{}; v.letter = (wchar_t)hd.letter; buildTime = hd.buildTime;
         ok = true;
-        for (uint64_t i = 0; i < h.nDirs && ok; i++) {
+        for (uint64_t i = 0; i < hd.nDirs && ok; i++) {
             uint16_t l = 0;
-            if (fread(&l, 2, 1, f) != 1) { ok = false; break; }
+            if (!rd(&l, 2)) { ok = false; break; }
             std::string u((size_t)l, 0);
-            if (l && fread(u.data(), 1, l, f) != l) { ok = false; break; }
+            if (l && !rd(u.data(), l)) { ok = false; break; }
             v.dirs.push_back(U8(u));
         }
         if (!ok) break;
-        v.recs.resize((size_t)h.nRecs);
-        for (uint64_t i = 0; i < h.nRecs && ok; i++) {
+        v.recs.resize((size_t)hd.nRecs);
+        for (uint64_t i = 0; i < hd.nRecs && ok; i++) {
             RecP p{};
-            if (fread(&p, sizeof p, 1, f) != 1) { ok = false; break; }
+            if (!rd(&p, sizeof p)) { ok = false; break; }
             Rec& r = v.recs[(size_t)i];
             r.nameOff = p.nameOff; r.nameLen = p.nameLen; r.lowerOff = p.lowerOff; r.lowerLen = p.lowerLen;
             r.parent = p.parent; r.size = p.size; r.mtime = p.mtime; r.attrs = p.attrs; r.cat = p.cat;
         }
         if (!ok) break;
         uint64_t nl = 0, ll = 0;
-        if (fread(&nl, 8, 1, f) != 1) { ok = false; break; }
+        if (!rd(&nl, 8)) { ok = false; break; }
         v.nameBlob.resize((size_t)nl);
-        if (nl && fread(v.nameBlob.data(), 1, (size_t)nl, f) != nl) { ok = false; break; }
-        if (fread(&ll, 8, 1, f) != 1) { ok = false; break; }
+        if (nl && !rd(v.nameBlob.data(), (size_t)nl)) { ok = false; break; }
+        if (!rd(&ll, 8)) { ok = false; break; }
         v.lowerBlob.resize((size_t)ll);
-        if (ll && fread(v.lowerBlob.data(), 1, (size_t)ll, f) != ll) { ok = false; break; }
+        if (ll && !rd(v.lowerBlob.data(), (size_t)ll)) { ok = false; break; }
     } while (0);
-    fclose(f);
+    CloseHandle(h);
     return ok;
 }
 
@@ -457,7 +469,15 @@ static void IndexerThread(std::stop_token st) {
             FILETIME f{}; GetSystemTimeAsFileTime(&f);
             uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
             std::wstring tmp = idxPath + L".tmp";
-            if (SaveVol(tmp, *v, buildTime)) MoveFileExW(tmp.c_str(), idxPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (SaveVol(tmp, *v, buildTime)) {
+                // C4：原子替换 + WRITE_THROUGH；读端若仍持有句柄会失败，重试 3 次（每次 200ms）。
+                bool moved = false;
+                for (int attempt = 0; attempt < 3 && !moved; ++attempt) {
+                    if (attempt) Sleep(200);
+                    moved = MoveFileExW(tmp.c_str(), idxPath.c_str(),
+                                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+                }
+            }
             CommitVol(v);
             g_indexStatus = L"索引已更新：" + std::wstring(1, letter) + L":";
             if (g_curEpoch > 0) RequestSearch();   // re-run with fresh data
@@ -2649,6 +2669,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                      SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
     case WM_DESTROY:
         if (g_memDc) {
             if (g_memOldBmp) SelectObject(g_memDc, g_memOldBmp);
@@ -2785,7 +2808,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nCmdShow) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    indexer.request_stop(); g_reqCv.notify_all();
+    // 索引线程停在 g_refreshCv.wait_for(30min) 里，必须显式 notify 唤醒它，
+    // 否则主线程 join 会一直阻塞到 30 分钟超时，进程关不掉、内存不释放。
+    indexer.request_stop(); g_refreshCv.notify_all();
     searcher.request_stop(); g_reqCv.notify_all();
     pump.request_stop();
     // drain pending app messages (free payloads)
