@@ -210,7 +210,7 @@ struct VolWatch {
     std::atomic<uint64_t> lastRescanMs{ 0 };
 };
 static VolWatch g_volWatch[26];
-static const size_t MAX_STORED = 20000;
+static const size_t MAX_STORED = 50000;
 
 // ---------------- string helpers ----------------
 static std::wstring U8(const std::string& s) {
