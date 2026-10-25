@@ -52,6 +52,7 @@
 #define WM_APP_GROUP_DEL (WM_APP + 14)  // 0x800E: group-menu D key
 #define WM_APP_MOVEGROUP (WM_APP + 15)  // 0x800F: 图标菜单「移动分组」→ 弹出分组列表
 #define WM_APP_CHANGEICON (WM_APP + 16) // 0x8010: 图标菜单「更换图标」→ 文件选择框
+#define WM_APP_TRAY_EXIT  (WM_APP + 17) // 0x8011: 托盘菜单按 D → 退出（自绘项没有 & 助记符）
 
 // RegisterHotKey id used for the user-configurable summon hotkey.
 #define ID_HOTKEY_TOGGLE        1

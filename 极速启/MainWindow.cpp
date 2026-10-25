@@ -139,6 +139,9 @@ static HFONT g_menuFont = nullptr;
 // 临时覆盖"文字到左右边框"的内边距（像素）。>0 时优先于默认值。
 // 托盘菜单要求"以最长一项为准、左右各留两个字"，由 MenuCharsWidth(2) 算出后设置。
 static int  g_menuPadPx = 0;
+// >0 时所有菜单项统一用这个宽度。owner-draw 菜单是按"每项实测宽度"布局的，
+// 各项宽度不一致时会出现"悬停到哪项、哪项的内边距就变"的怪现象，必须统一。
+static int  g_menuFixedW = 0;
 
 // 文字到左右边框的距离：系统默认菜单左侧内边距约 20px，取一半并左右一致。
 static int MenuPadX() {
@@ -246,6 +249,7 @@ static bool HandleMenuMeasure(MEASUREITEMSTRUCT* m) {
     const int pad = MenuPadX();
     const int gap = MenuGapX();       // 主文字 → 快捷键，约三个字符
     int w = pad + mainW + (accW > 0 ? gap + accW : 0) + pad;
+    if (g_menuFixedW > 0) w = g_menuFixedW;   // 统一宽度：避免逐项宽度不同导致布局跳动
     m->itemWidth  = static_cast<UINT>(w);
     m->itemHeight = static_cast<UINT>(GetSystemMetrics(SM_CYMENU));
     return true;
@@ -353,6 +357,10 @@ static UINT MenuKeyAction(int kind, WPARAM vk) {
         if (vk == 'N' || vk == 'n') return WM_APP_GROUP_NEW;
         if (vk == VK_F2) return WM_APP_GROUP_REN;
         if (vk == 'D' || vk == 'd') return WM_APP_GROUP_DEL;
+        return 0;
+    }
+    if (kind == 4) {                       // 托盘菜单：恢复「退出(D)」的 D 键
+        if (vk == 'D' || vk == 'd') return WM_APP_TRAY_EXIT;
         return 0;
     }
     return 0;
@@ -1367,6 +1375,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_CHANGEICON:
             ChangeItemIcon(m_selected);
+            return 0;
+        case WM_APP_TRAY_EXIT:      // 托盘菜单按 D（自绘项没有 & 助记符，靠键盘钩子补回来）
+            m_app->Quit();
             return 0;
         case WM_APP_GROUP_NEW:
             NewGroup();
@@ -3778,6 +3789,26 @@ void MainWindow::ShowTrayMenu() {
     g_menuText.clear();
     g_menuDpi = m_dpi;
     g_menuPadPx = MenuCharsWidth(2);
+    // 所有项统一成一个宽度：owner-draw 菜单按"每项实测宽度"布局，
+    // 宽度不一致会出现"悬停到哪项、哪项内边距就变"的跳动。
+    {
+        int maxW = 0;
+        HDC dc = GetDC(nullptr);
+        if (dc) {
+            HGDIOBJ old = SelectObject(dc, MenuFont());
+            for (const wchar_t* s : { L"显示窗口", L"设置",
+                                      L"暂停使用快捷键（开）", L"暂停使用快捷键（关）",
+                                      L"暂停使用鼠标（开）", L"暂停使用鼠标（关）",
+                                      L"退出(D)" }) {
+                int tw = 0;
+                TextWidth(dc, s, tw);
+                if (tw > maxW) maxW = tw;
+            }
+            SelectObject(dc, old);
+            ReleaseDC(nullptr, dc);
+        }
+        g_menuFixedW = g_menuPadPx * 2 + maxW;
+    }
     AddMenuText(hMenu, ID_TRAY_SHOW, L"显示窗口");
     AddMenuText(hMenu, ID_TRAY_SETTINGS, L"设置");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -3792,9 +3823,17 @@ void MainWindow::ShowTrayMenu() {
     GetCursorPos(&pt);
     // Required so the menu does not vanish immediately on show.
     SetForegroundWindow(m_hwnd);
+    // 自绘项里 '&' 不生效，所以「退出(D)」的 D 由键盘钩子补回来（只在菜单打开期间有效）。
+    g_menuKind = 4;
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD, KeyboardHookProc, nullptr, GetCurrentThreadId());
+    HHOOK hook2 = SetWindowsHookExW(WH_GETMESSAGE, MenuGetMsgProc, nullptr, GetCurrentThreadId());
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
                    pt.x, pt.y, 0, m_hwnd, nullptr);
+    if (hook) UnhookWindowsHookEx(hook);
+    if (hook2) UnhookWindowsHookEx(hook2);
+    g_menuKind = 0;
     g_menuPadPx = 0;          // 恢复默认内边距，别影响其它菜单
+    g_menuFixedW = 0;         // 恢复"按每项实测宽度"（图标菜单需要按内容自动宽）
     DestroyMenu(hMenu);
 }
 
