@@ -260,9 +260,24 @@ static bool HandleMenuDraw(DRAWITEMSTRUCT* d) {
     const MenuItemText* t = MenuItemAt(static_cast<LONG_PTR>(d->itemData));
     const bool sel = (d->itemState & ODS_SELECTED) != 0;
     const bool dis = (d->itemState & ODS_GRAYED) != 0;
-    HBRUSH br = CreateSolidBrush(sel ? RGB(0xE5, 0xF4, 0xFD) : RGB(0xFF, 0xFF, 0xFF));
-    FillRect(d->hDC, &d->rcItem, br);
+    HBRUSH br = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
+    FillRect(d->hDC, &d->rcItem, br);   // 整行先铺白底
     DeleteObject(br);
+    if (sel) {
+        // 选中底色内缩 4px + 圆角。原来铺满整行会一直压到左右边框，看着像文字贴近边框、
+        // 左右间距"变小了"（实测文字位置其实一直没变，是底色贴边造成的错觉）。
+        const int In = 4;
+        Gdiplus::RectF rb(static_cast<Gdiplus::REAL>(d->rcItem.left + In),
+                          static_cast<Gdiplus::REAL>(d->rcItem.top + 1),
+                          static_cast<Gdiplus::REAL>(d->rcItem.right - d->rcItem.left - In * 2),
+                          static_cast<Gdiplus::REAL>(d->rcItem.bottom - d->rcItem.top - 2));
+        Gdiplus::Graphics g(d->hDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::GraphicsPath p;
+        JisuqUI::RoundRectPath(p, rb, 6.0f);
+        Gdiplus::SolidBrush b(Gdiplus::Color(255, 0xE5, 0xF4, 0xFD));
+        g.FillPath(&b, &p);
+    }
     if (!t) return true;
     const int pad = MenuPadX();
     const int gap = MenuGapX();       // 主文字 → 快捷键，约三个字符
@@ -1192,6 +1207,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MEASUREITEM:
             if (HandleMenuMeasure(reinterpret_cast<MEASUREITEMSTRUCT*>(lp))) return TRUE;
             break;
+        case WM_MENUCHAR: {
+            // 自绘菜单项没有 '&' 助记符，按键会以 WM_MENUCHAR 问到 owner 窗口。
+            // 托盘菜单里把 D 当成「退出」（比键盘钩子可靠，不依赖焦点/钩子链）。
+            const UINT ch = static_cast<UINT>(LOWORD(lp));
+            if (g_menuKind == 4 && (ch == 'd' || ch == 'D'))
+                return MAKELONG(MNC_EXECUTE, 6);   // 第 6 项 = 退出(D)（含两个分隔符）
+            break;
+        }
         case WM_DRAWITEM:
             if (HandleMenuDraw(reinterpret_cast<DRAWITEMSTRUCT*>(lp))) return TRUE;
             break;
