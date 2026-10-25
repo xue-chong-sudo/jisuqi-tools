@@ -7,6 +7,7 @@
 #include <functional>
 #include <algorithm>
 #include <mutex>              // 工作线程任务槽
+#include <malloc.h>           // _heapmin
 #include <condition_variable>
 
 // OCR 引擎：用 unique_ptr + 自定义删除器管理生命周期，避免全局裸指针与重复
@@ -16,6 +17,25 @@ static auto g_ocrDeleter = [](tesseract::TessBaseAPI* p) {
 };
 static std::unique_ptr<tesseract::TessBaseAPI, decltype(g_ocrDeleter)>
     g_ocr{ nullptr, g_ocrDeleter };
+
+// ---- 引擎生命周期（懒加载 / 用完卸载）----
+// 实测（120dpi, 800x500 选区）：引擎一加载就占 46MB(中文)/56MB(中英) 提交内存，
+// 而 Init 只要 104~196ms、单次识别 0.6~0.8s。所以宿主模式改成：
+//   启动不加载 -> 触发截图时后台预加载（藏在用户框选的 1~3 秒里）
+//   -> 识别完成后立刻 End()+delete，并把工作集还给系统。
+// 这样静默时进程只剩 1~2MB，"一直挂着"不再占几十 MB。
+static std::mutex   g_engineMu;             // 保护 g_ocr 的创建/销毁
+static std::wstring g_dataDir;              // tessdata 目录（重载时用）
+static std::wstring g_langStr = L"chi_sim+eng";
+static bool         g_unloadAfterUse = false;   // 宿主模式：每次用完就卸载
+static bool         g_initFailed = false;       // Init 试过且失败（粘滞，供宿主提示）
+
+static void TrimHeap() {
+    // 把识别期间的临时工作区还给系统：提交内存降不下来，但工作集（任务管理器
+    // 显示的那个数）能立刻掉到几 MB，物理内存也就真的让出来了。
+    _heapmin();
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
 
 // 进入非 ASCII 路径分支时切到 tessdata 所在目录，退出时无条件还原工作目录，
 // 即便 Init 抛异常也能还原（RAII）。
@@ -48,16 +68,17 @@ static std::wstring AbsPath(const wchar_t* p) {
     return (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : std::wstring(p ? p : L"");
 }
 
-bool OcrInit(const wchar_t* tessdata, const wchar_t* lang) {
-    if (g_ocr) return true; // 已初始化，幂等返回，避免重复 new 造成泄漏
-    std::string lg = W2U8(lang);
+// 真正干活的 Init（调用方必须已持有 g_engineMu）
+static bool InitLocked(const std::wstring& dir, const std::wstring& lang) {
+    if (g_ocr) return true;                 // 已初始化，幂等返回
+    std::string lg = W2U8(lang.c_str());
     auto* api = new tesseract::TessBaseAPI();
     int r;
-    if (!tessdata || !*tessdata) {
+    if (dir.empty()) {
         // 空路径：使用 Tesseract 默认搜索（当前目录）
         r = api->Init(nullptr, lg.c_str());
     } else {
-        std::wstring abs = AbsPath(tessdata);
+        std::wstring abs = AbsPath(dir.c_str());
         if (IsAllAscii(abs.c_str())) {
             // 纯 ASCII 路径：直接以绝对路径加载（最快，无副作用）
             std::string dp = W2U8(abs.c_str());
@@ -75,15 +96,42 @@ bool OcrInit(const wchar_t* tessdata, const wchar_t* lang) {
             // cwd 析构时自动还原工作目录
         }
     }
-    if (r != 0) { delete api; return false; }
+    if (r != 0) { delete api; g_initFailed = true; return false; }
     g_ocr.reset(api);
+    g_initFailed = false;
     return true;
+}
+
+bool OcrInit(const wchar_t* tessdata, const wchar_t* lang) {
+    OcrSetEngineParams(tessdata, lang);
+    std::lock_guard<std::mutex> lk(g_engineMu);
+    return InitLocked(g_dataDir, g_langStr);
+}
+
+void OcrSetEngineParams(const wchar_t* tessdata, const wchar_t* lang) {
+    std::lock_guard<std::mutex> lk(g_engineMu);
+    g_dataDir = (tessdata && *tessdata) ? tessdata : L"";
+    g_langStr = (lang && *lang) ? lang : L"chi_sim+eng";
+}
+
+void OcrSetUnloadAfterUse(bool on) {
+    g_unloadAfterUse = on;
+}
+
+bool OcrInitFailed() { return g_initFailed; }
+
+// 确保引擎可用（工作线程调用；加载耗时才 100~200ms）
+static bool EnsureEngine() {
+    std::lock_guard<std::mutex> lk(g_engineMu);
+    if (g_ocr) return true;
+    return InitLocked(g_dataDir, g_langStr);
 }
 
 void WaitAsyncOcr(); // 前置声明：等待后台 OCR 线程结束
 
 void OcrShutdown() {
     WaitAsyncOcr(); // 先等后台 OCR 结束，再销毁引擎，避免线程还在用 g_ocr
+    std::lock_guard<std::mutex> lk(g_engineMu);
     g_ocr.reset();  // 删除器会调用 End() + delete
 }
 
@@ -180,6 +228,7 @@ std::vector<OcrWord> OcrImage(const CaptureImage& img) {
 //   - 单一引擎，工作线程串行使用，无需额外锁。
 // ------------------------------------------------------------------
 struct OcrJob {
+    enum Kind { Recognize, Prewarm, Unload } kind = Recognize;
     CaptureImage img;
     std::function<void(std::vector<OcrWord>)> cb;
 };
@@ -204,17 +253,64 @@ static void OcrWorkerLoop() {
             job = std::move(g_pending);
             g_pending.reset();
         }
-        if (job) {
-            std::vector<OcrWord> words = OcrImage(job->img);
-            if (job->cb) job->cb(std::move(words));
+        if (!job) continue;
+        if (job->kind == OcrJob::Prewarm) {
+            EnsureEngine();          // 单纯把引擎读起来，识别前先热身
+            continue;
+        }
+        if (job->kind == OcrJob::Unload) {
+            // 取消截图等"没有识别"的场景：把已经预热的引擎拆掉，别白占 50MB。
+            std::lock_guard<std::mutex> lk(g_engineMu);
+            g_ocr.reset();
+            TrimHeap();
+            continue;
+        }
+        EnsureEngine();              // 懒加载：真正要用时才加载（100~200ms）
+        std::vector<OcrWord> words = OcrImage(job->img);
+        if (job->cb) job->cb(std::move(words));
+        if (g_unloadAfterUse) {
+            // 用完立刻卸载 + 把工作集还给系统：静默时进程只剩 1~2MB。
+            std::lock_guard<std::mutex> lk(g_engineMu);
+            g_ocr.reset();
+            TrimHeap();
         }
     }
 }
 
-void OcrImageAsync(const CaptureImage& img,
-                   std::function<void(std::vector<OcrWord>)> onDone) {
+// 预热：触发截图的那一刻就调，用户还在框选，加载就已经在后台做完了。
+void OcrPrewarm() {
+    if (g_ocr) return;                       // 已经热着，什么都不用做
     std::call_once(g_workerOnce, [] { g_worker = std::thread(OcrWorkerLoop); });
+    {
+        std::lock_guard<std::mutex> lk(g_jobMu);
+        if (g_pending) return;               // 队列里已有任务，别覆盖掉真正的识别
+        auto job = std::make_shared<OcrJob>();
+        job->kind = OcrJob::Prewarm;
+        g_pending = std::move(job);
+    }
+    g_jobCv.notify_one();
+}
+
+// 取消截图（没有产生识别任务）时调用：把预热好的引擎拆掉。
+// 做成"任务"而不是立刻拆，是为了排在正在跑的识别后面，避免把引擎抽走。
+void OcrRequestUnload() {
+    if (!g_unloadAfterUse) return;
+    std::call_once(g_workerOnce, [] { g_worker = std::thread(OcrWorkerLoop); });
+    {
+        std::lock_guard<std::mutex> lk(g_jobMu);
+        // 队列里已有识别任务：它会自己收尾（识别完就卸载），别插队覆盖掉
+        if (g_pending && g_pending->kind == OcrJob::Recognize) return;
+        auto job = std::make_shared<OcrJob>();
+        job->kind = OcrJob::Unload;
+        g_pending = std::move(job);
+    }
+    g_jobCv.notify_one();
+}
+
+void OcrImageAsync(const CaptureImage& img,
+                   std::function<void(std::vector<OcrWord>)> onDone) {    std::call_once(g_workerOnce, [] { g_worker = std::thread(OcrWorkerLoop); });
     auto job = std::make_shared<OcrJob>();
+    job->kind = OcrJob::Recognize;
     job->img = img;               // 复制一份像素，线程生命周期独立于调用方
     job->cb  = std::move(onDone);
     {

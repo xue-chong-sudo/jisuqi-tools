@@ -12,8 +12,14 @@ int ocraddon_init(const wchar_t* tessdata_path, const wchar_t* lang) {
 
 int ocraddon_capture_and_copy(void) {
     CaptureImage img = CaptureRegionInteractive();
-    if (img.width == 0) return 0; // 取消
+    if (img.width == 0) {         // 取消：把预热好的引擎卸掉（否则白占 50MB）
+        OcrRequestUnload();
+        return 0;
+    }
     ShowResultAndCopy(std::move(img)); // 窗口先显示，OCR 在后台进行
+    // 结果窗关闭后这里才返回：此时识别早已结束、引擎也已卸载，再压一次工作集，
+    // 把结果窗那几张位图占的物理内存也还回去（否则会停在 10MB 左右）。
+    OcrRequestUnload();
     return 0;
 }
 
@@ -30,6 +36,26 @@ void ocraddon_set_newline_smart(int smart) {
 
 void ocraddon_set_exit_mode(int exitMode) {
     SetExitMode(exitMode);
+}
+
+void ocraddon_set_engine(const wchar_t* tessdata_path, const wchar_t* lang) {
+    OcrSetEngineParams(tessdata_path, lang);
+}
+
+void ocraddon_prewarm(void) {
+    OcrPrewarm();
+}
+
+void ocraddon_set_unload_after_use(int on) {
+    OcrSetUnloadAfterUse(on != 0);
+}
+
+int ocraddon_init_failed(void) {
+    return OcrInitFailed() ? 1 : 0;
+}
+
+void ocraddon_unload_if_idle(void) {
+    OcrRequestUnload();
 }
 
 void ocraddon_shutdown(void) {

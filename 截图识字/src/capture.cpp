@@ -309,7 +309,13 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) { g.captured = false; g.done = true; DestroyWindow(h); }
             break;
-        case WM_DESTROY: PostQuitMessage(0); break;
+        case WM_DESTROY:
+            // 注意：这里**不能** PostQuitMessage。
+            // 本窗口的消息循环是靠 g.done 跳出的（见 CaptureRegionInteractive 末尾），
+            // 跳出时不会去取 WM_QUIT；残留的 WM_QUIT 会被外层的宿主主循环读到，
+            // 于是"取消截图"会把这个常驻宿主进程一起杀掉 —— 下次截图又要重新启动
+            // 进程、重新加载 OCR 引擎（用户感知就是"点一下要等好几秒")。
+            break;
     }
     return DefWindowProc(h, m, w, l);
 }

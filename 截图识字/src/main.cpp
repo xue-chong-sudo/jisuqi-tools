@@ -45,8 +45,25 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         ReadShotSettings(mode, wrap, exitMode);
         ocraddon_set_newline_smart(wrap);
         ocraddon_set_exit_mode(exitMode);
-        if (mode == 1) ocraddon_capture_direct();       // 直接截图：图片进剪贴板
-        else           ocraddon_capture_and_copy();     // 启动识图：截图 -> OCR -> 选词复制
+        if (mode == 1) {
+            ocraddon_capture_direct();      // 直接截图：图片进剪贴板（不用 OCR，不预热）
+        } else {
+            // 引擎是懒加载的（省 46~56MB）：先看上次是否加载失败，别让用户白框一次
+            static bool warned = false;
+            if (ocraddon_init_failed() && !warned) {
+                warned = true;
+                MessageBoxW(nullptr,
+                            L"OCR 识别引擎加载失败：请检查 screenshot\\tessdata 目录里的 "
+                            L"chi_sim.traineddata / eng.traineddata 是否完整。",
+                            L"截图识字", MB_ICONERROR);
+                g_busy = false;
+                return 0;
+            }
+            // 关键：在弹出选框之前就把引擎预读起来（约 0.1~0.2 秒）。用户还在
+            // 框选的时候它已经加载完，感觉不到任何等待。
+            ocraddon_prewarm();
+            ocraddon_capture_and_copy();    // 启动识图：截图 -> OCR -> 选词复制
+        }
         g_busy = false;
         return 0;
     }
@@ -62,10 +79,18 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // 宿主模式主循环：隐藏窗口常驻，等极速启触发
 int RunHost(const std::wstring& tessdata, const std::wstring& ini) {
-    if (ocraddon_init(tessdata.c_str(), L"chi_sim+eng") != 0) {
-        MessageBoxW(nullptr, L"OCR 初始化失败，请检查 tessdata 目录与语言包", L"截图识字", MB_ICONERROR);
-        return 1;
+    // 宿主单实例：极速启被强杀时会留下旧宿主（现在宿主会一直常驻），
+    // 下次启动极速启再拉起一个就会出现两个选框/两份内存，所以这里挡一下。
+    HANDLE hostMutex = CreateMutexW(nullptr, TRUE, L"JisuQiShotHost_SingleInstance");
+    if (hostMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hostMutex);
+        return 0;
     }
+    // 懒加载：这里只记住 tessdata 与语言，不读模型。
+    // 引擎一加载就占 46~56MB 提交内存，而加载只要 0.1~0.2 秒，所以放到
+    // 触发截图那一刻在后台预热（见 HostProc），用完立刻卸载。
+    ocraddon_set_engine(tessdata.c_str(), L"chi_sim+eng");
+    ocraddon_set_unload_after_use(1);
     g_iniPath = ini;
     g_msgTrigger = RegisterWindowMessageW(kTriggerName);
 
@@ -85,6 +110,7 @@ int RunHost(const std::wstring& tessdata, const std::wstring& ini) {
         DispatchMessageW(&msg);
     }
     ocraddon_shutdown();
+    if (hostMutex) CloseHandle(hostMutex);
     return 0;
 }
 

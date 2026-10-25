@@ -76,6 +76,18 @@ const wchar_t* ShotIniPath();
 bool OcrInit(const wchar_t* tessdata, const wchar_t* lang);
 void OcrShutdown();
 
+// —— 引擎懒加载（宿主模式）——
+// 只记参数：启动时调用，不加载引擎（引擎 46~56MB，加载 100~200ms）。
+void OcrSetEngineParams(const wchar_t* tessdata, const wchar_t* lang);
+// 每次识别完成后是否立刻卸载引擎并把工作集还给系统。
+void OcrSetUnloadAfterUse(bool on);
+// 预热：把加载任务塞给后台工作线程，趁用户框选时完成。
+void OcrPrewarm();
+// Init 试过且失败（tessdata 缺失等），供宿主提示。
+bool OcrInitFailed();
+// 取消截图（没有产生识别任务）后卸载已预热的引擎（排队执行，不打断识别）。
+void OcrRequestUnload();
+
 // 后台 OCR：内部先复制图像数据，在工作线程识别，完成后在工作线程上下文回调
 void OcrImageAsync(const CaptureImage& img,
                    std::function<void(std::vector<OcrWord>)> onDone);
