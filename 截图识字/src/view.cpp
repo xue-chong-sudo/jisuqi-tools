@@ -16,6 +16,7 @@
 #include <atomic>
 #include <functional>
 #include "text_join.h"   // 智能换行：textjoin::JoinLines
+#include <shlobj.h>      // 保存到桌面（CSIDL_DESKTOPDIRECTORY）
 #include <gdiplus.h>     // 标注与工具栏的抗锯齿绘制（wWinMain 已 GdiplusStartup）
 
 // GET_X_LPARAM / GET_Y_LPARAM are normally in <windowsx.h>, but that header
@@ -509,16 +510,17 @@ constexpr int kTbCell = 44;   // 每项格子边长
 constexpr int kTbPad  = 14;   // 条内左右边距
 constexpr int kTbGap  = 24;   // 分组间隔（形状|颜色|粗细 之间）
 constexpr int kTbH    = 72;   // 条高
-constexpr int kTbItems = 15;  // 语义项数：0-3 粗细，4-9 颜色，10-13 工具，14 抓取文字
+constexpr int kTbItems = 16;  // 语义项数：0-3 粗细，4-9 颜色，10-13 工具，14 抓取文字，15 下载
 
 // 视觉顺序 -> 语义索引。
-// 用户要求的新排列：形状(矩形/椭圆/箭头) → 笔 → 文字 丨 颜色 丨 粗细。
-// 好处是语义索引（0-3 粗细 / 4-9 颜色 / 10-14 工具）保持不变，
+// 用户要求的新排列：形状(矩形/椭圆/箭头) → 笔 → 文字 → 下载 丨 颜色 丨 粗细。
+// 「下载」紧跟在「文字」后面、两者之间不画分界线（用户明确要求）。
+// 好处是语义索引（0-3 粗细 / 4-9 颜色 / 10-15 工具与动作）保持不变，
 // 选中、命中、绘制逻辑都不用改，只在这一层做映射。
 static const int kTbOrder[kTbItems] = {
-    10, 11, 12, 13, 14,   // 形状 3 个 + 笔 + 文字
-     4,  5,  6,  7,  8, 9, // 颜色 6 个
-     0,  1,  2,  3         // 粗细 4 个
+    10, 11, 12, 13, 14, 15,   // 形状 3 个 + 笔 + 文字 + 下载
+     4,  5,  6,  7,  8, 9,    // 颜色 6 个
+     0,  1,  2,  3            // 粗细 4 个
 };
 
 int TbWidth() { return kTbPad * 2 + kTbItems * kTbCell + 2 * kTbGap; }
@@ -536,8 +538,8 @@ POINT  g_tbDragPt{ 0, 0 };     // 拖动起点（屏幕坐标）
 POINT  g_tbDragPos{ 0, 0 };    // 拖动起点时的窗口位置
 
 RECT TbItemRect(const RECT& tb, int i) {
-    // 分组：[0..4] 形状/笔/文字  [5..10] 颜色  [11..14] 粗细
-    int gapsBefore = (i >= 11) ? 2 : (i >= 5) ? 1 : 0;
+    // 分组：[0..5] 形状/笔/文字/下载  [6..11] 颜色  [12..15] 粗细
+    int gapsBefore = (i >= 12) ? 2 : (i >= 6) ? 1 : 0;
     int x = tb.left + kTbPad + i * kTbCell + gapsBefore * kTbGap;
     int y = tb.top + (kTbH - kTbCell) / 2;
     return { x, y, x + kTbCell, y + kTbCell };
@@ -551,13 +553,94 @@ int TbHitTest(const RECT& tb, POINT pt) {
     }
     return -1;
 }
+// ---- 工具栏「下载」：把当前图（含已画标注）另存为文件 ----
+static int TbEncoderClsid(const wchar_t* mime, CLSID* clsid) {
+    UINT num = 0, bytes = 0;
+    if (GetImageEncodersSize(&num, &bytes) != Ok || bytes == 0) return -1;
+    std::vector<BYTE> buf(bytes);
+    auto* info = reinterpret_cast<ImageCodecInfo*>(buf.data());
+    if (GetImageEncoders(num, bytes, info) != Ok) return -1;
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(info[i].MimeType, mime) == 0) { *clsid = info[i].Clsid; return (int)i; }
+    }
+    return -1;
+}
+static std::wstring TbDefaultSavePath() {
+    wchar_t dir[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, dir)) ||
+        !dir[0])
+        GetCurrentDirectoryW(MAX_PATH, dir);
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    wchar_t name[64];
+    swprintf(name, 64, L"截图_%04d%02d%02d_%02d%02d%02d.png",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return std::wstring(dir) + L"\\" + name;
+}
+void TbSaveToFile(HWND owner) {
+    const int W = g.img.width, H = g.img.height;
+    if (W <= 0 || H <= 0 || g.img.rgb.empty()) return;
+    std::wstring def = TbDefaultSavePath();
+    std::vector<wchar_t> buf(MAX_PATH, 0);
+    size_t cp = def.size() < MAX_PATH - 1 ? def.size() : MAX_PATH - 1;
+    memcpy(buf.data(), def.c_str(), cp * sizeof(wchar_t));
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g.hwnd ? g.hwnd : owner;
+    ofn.lpstrFilter = L"PNG 图片 (*.png)\0*.png\0JPEG 图片 (*.jpg)\0*.jpg\0所有文件 (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"png";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return;      // 用户取消
+
+    std::wstring path(buf.data());
+    std::wstring ext;
+    size_t dot = path.find_last_of(L'.');
+    if (dot != std::wstring::npos) ext = path.substr(dot + 1);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    const bool jpg = (ext == L"jpg" || ext == L"jpeg");
+    CLSID clsid{};
+    if (TbEncoderClsid(jpg ? L"image/jpeg" : L"image/png", &clsid) < 0) {
+        MessageBoxW(ofn.hwndOwner, L"系统缺少对应的图片编码器，无法保存。", L"下载",
+                    MB_ICONWARNING);
+        return;
+    }
+    // 复制到自有位图后再画标注：绝不能在 g.img.rgb 上画，否则标注会“烙”进原图
+    gp::Bitmap bmp(W, H, PixelFormat24bppRGB);
+    if (bmp.GetLastStatus() != Ok) return;
+    {
+        gp::Rect rc(0, 0, W, H);
+        gp::BitmapData bd{};
+        if (bmp.LockBits(&rc, gp::ImageLockModeWrite, PixelFormat24bppRGB, &bd) != Ok) return;
+        for (int y = 0; y < H; ++y)
+            memcpy((BYTE*)bd.Scan0 + (size_t)y * bd.Stride,
+                   &g.img.rgb[(size_t)y * W * 3], (size_t)W * 3);
+        bmp.UnlockBits(&bd);
+        if (!g.annos.empty()) {
+            gp::Graphics gr(&bmp);
+            gr.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+            for (const Anno& a : g.annos) DrawAnnoAt(gr, a, 1.0, 0.f, 0.f);
+        }
+    }
+    if (bmp.Save(path.c_str(), &clsid, nullptr) != Ok) {
+        MessageBoxW(ofn.hwndOwner, L"保存失败（路径只读、磁盘空间不足或被占用）。",
+                    L"下载", MB_ICONWARNING);
+        return;
+    }
+    std::wstring msg = L"已保存到：\n" + path;
+    MessageBoxW(ofn.hwndOwner, msg.c_str(), L"下载", MB_ICONINFORMATION);
+}
+
 // 按下工具栏某项：短按（松开）=选择；长按 0.3 秒=转为拖拽整条工具栏
 void TbApplySelection(int idx) {
     if (idx < 0) return;
     if (idx < 4)       g.annWidth = idx;
     else if (idx < 10) g.annColor = idx - 4;
     else if (idx < 14) g.tool = idx - 9;    // 矩形/椭圆/箭头/笔
-    else               g.tool = AT_TEXT;    // 抓取文字
+    else if (idx == 14) g.tool = AT_TEXT;   // 抓取文字
+    else                TbSaveToFile(g_tb); // 15 = 下载（动作按钮，不改变当前工具）
 }
 RECT TbWorkArea(HWND ref) {
     HMONITOR hm = MonitorFromWindow(ref, MONITOR_DEFAULTTONEAREST);
@@ -590,11 +673,11 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
         gp::Pen border(Color(255, 224, 227, 231), 1.5f);
         gr.DrawPath(&border, &path);
     }
-    // 分组分界线（淡灰竖线，微信风格）：形状/笔/文字 ┃ 颜色 ┃ 粗细
-    // 位置 4（文字）与位置 10（最后一个颜色）之后各一条。
+    // 分组分界线（淡灰竖线，微信风格）：形状/笔/文字/下载 ┃ 颜色 ┃ 粗细
+    // 「文字」与「下载」之间不画线（用户要求），所以线在位置 5（下载）与 11（最后一个颜色）之后各一条。
     {
         gp::Pen dv(Color(255, 226, 229, 233), 1.5f);
-        for (int gi : {4, 10}) {
+        for (int gi : {5, 11}) {
             RECT a = TbItemRect(tb, gi), b = TbItemRect(tb, gi + 1);
             float gx = (a.right + b.left) / 2.0f;
             gr.DrawLine(&dv, PointF(gx, tb.top + 16), PointF(gx, tb.bottom - 16));
@@ -608,7 +691,8 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
         bool sel = (sem < 4)  ? (g.annWidth == sem)
                  : (sem < 10) ? (g.annColor == sem - 4)
                  : (sem < 14) ? (g.tool == sem - 9)
-                 :              (g.tool == AT_TEXT);   // 「抓取文字」=框选模式
+                 : (sem == 14) ? (g.tool == AT_TEXT)   // 「抓取文字」=框选模式
+                 :               false;                // 15「下载」是动作按钮，没有选中态
         bool hov = (g_tbHover == sem);
         if (sel || hov) {   // 选中/悬停：浅灰圆角方块底
             gp::GraphicsPath path;
@@ -638,7 +722,23 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
             pen.SetEndCap(gp::LineCapRound);
             pen.SetLineJoin(gp::LineJoinRound);
             int t = (sem < 14) ? (sem - 9) : AT_TEXT;
-            switch (t) {
+            if (sem == 15) {
+                // 「下载」：向下的箭头 + 下方托盘。托盘是个方括号形状，
+                // 两个下角用圆弧过渡（用户明确要求），笔帽圆头所以两端也圆。
+                PointF tip(cx, ir.Y + 26);
+                gr.DrawLine(&pen, PointF(cx, ir.Y + 9), tip);
+                gr.DrawLine(&pen, PointF(cx - 6.5f, ir.Y + 19.5f), tip);
+                gr.DrawLine(&pen, PointF(cx + 6.5f, ir.Y + 19.5f), tip);
+                const float bx0 = cx - 9.5f, bx1 = cx + 9.5f;
+                const float bTop = ir.Y + 28.0f, bBot = ir.Y + 34.5f, rr = 4.0f;
+                gp::GraphicsPath tray;
+                tray.AddLine(bx0, bTop, bx0, bBot - rr);
+                tray.AddArc(bx0, bBot - 2 * rr, 2 * rr, 2 * rr, 180, -90);
+                tray.AddLine(bx0 + rr, bBot, bx1 - rr, bBot);
+                tray.AddArc(bx1 - 2 * rr, bBot - 2 * rr, 2 * rr, 2 * rr, 90, -90);
+                tray.AddLine(bx1, bBot - rr, bx1, bTop);
+                gr.DrawPath(&pen, &tray);
+            } else switch (t) {
                 case AT_RECT: {
                     // 方形图标：四角倒小圆弧（用户要求）
                     gp::GraphicsPath rp;
