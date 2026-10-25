@@ -68,6 +68,10 @@ void SetExitMode(int exitMode);
 // 供“直接截图”模式使用；成功返回 true。
 bool CopyImageToClipboard(const CaptureImage& img);
 
+// 极速启 data\settings.ini 的绝对路径（main.cpp 提供）。用于把“上次保存目录”
+// 这类小状态放在同一个 data 目录里，不额外污染其它位置。取不到时返回空串。
+const wchar_t* ShotIniPath();
+
 // OCR 引擎（Tesseract 后端），生命周期由 ocr_tesseract.cpp 内部持有
 bool OcrInit(const wchar_t* tessdata, const wchar_t* lang);
 void OcrShutdown();

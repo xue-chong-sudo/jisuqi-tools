@@ -565,16 +565,61 @@ static int TbEncoderClsid(const wchar_t* mime, CLSID* clsid) {
     }
     return -1;
 }
+// 「上次保存到哪个目录」记在 data\lastsave.txt（与 settings.ini 同目录）。
+// 这样下次保存默认就在上次的位置，不用每次重新找目录。
+static std::wstring TbLastSaveFile() {
+    std::wstring base;
+    std::wstring ini = ShotIniPath();
+    if (!ini.empty()) {
+        size_t p = ini.find_last_of(L'\\');
+        base = (p == std::wstring::npos) ? std::wstring() : ini.substr(0, p);
+    }
+    if (base.empty()) {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring s = exe;
+        size_t p = s.find_last_of(L'\\');
+        base = (p == std::wstring::npos) ? std::wstring(L".") : s.substr(0, p);
+    }
+    return base + L"\\lastsave.txt";
+}
+static std::wstring TbLastSaveDir() {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, TbLastSaveFile().c_str(), L"rb") != 0 || !f) return {};
+    wchar_t buf[512] = {};
+    size_t n = fread(buf, sizeof(wchar_t), 511, f);
+    fclose(f);
+    if (!n) return {};
+    std::wstring s(buf, n);
+    while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r' || s.back() == L' ')) s.pop_back();
+    if (s.empty()) return {};
+    DWORD at = GetFileAttributesW(s.c_str());
+    if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    return s;
+}
+static void TbStoreLastDir(const std::wstring& filePath) {
+    size_t p = filePath.find_last_of(L'\\');
+    if (p == std::wstring::npos || p == 0) return;
+    std::wstring dir = filePath.substr(0, p);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, TbLastSaveFile().c_str(), L"wb") != 0 || !f) return;
+    fwrite(dir.c_str(), sizeof(wchar_t), dir.size(), f);
+    fclose(f);
+}
 static std::wstring TbDefaultSavePath() {
-    wchar_t dir[MAX_PATH] = {};
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, dir)) ||
-        !dir[0])
-        GetCurrentDirectoryW(MAX_PATH, dir);
+    std::wstring dir = TbLastSaveDir();
+    if (dir.empty()) {
+        wchar_t desk[MAX_PATH] = {};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desk)) ||
+            !desk[0])
+            GetCurrentDirectoryW(MAX_PATH, desk);
+        dir = desk;
+    }
     SYSTEMTIME st{}; GetLocalTime(&st);
     wchar_t name[64];
     swprintf(name, 64, L"截图_%04d%02d%02d_%02d%02d%02d.png",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return std::wstring(dir) + L"\\" + name;
+    return dir + L"\\" + name;
 }
 void TbSaveToFile(HWND owner) {
     const int W = g.img.width, H = g.img.height;
@@ -629,8 +674,8 @@ void TbSaveToFile(HWND owner) {
                     L"下载", MB_ICONWARNING);
         return;
     }
-    std::wstring msg = L"已保存到：\n" + path;
-    MessageBoxW(ofn.hwndOwner, msg.c_str(), L"下载", MB_ICONINFORMATION);
+    // 成功不弹提示（用户要求：点保存就直接确认）；只记住这次选的目录，下次默认还在这里。
+    TbStoreLastDir(path);
 }
 
 // 按下工具栏某项：短按（松开）=选择；长按 0.3 秒=转为拖拽整条工具栏
@@ -695,8 +740,11 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
                  :               false;                // 15「下载」是动作按钮，没有选中态
         bool hov = (g_tbHover == sem);
         if (sel || hov) {   // 选中/悬停：浅灰圆角方块底
+            // 底色比格子内缩 3px：相邻两项（如「文字」和「下载」）不会粘成一整块长方形，
+            // 每个都是一眼可辨的独立方块（用户反馈的"下载框怎么是长方形"就是这个粘连）。
+            gp::RectF hb(ir.X + 3, ir.Y + 3, ir.Width - 6, ir.Height - 6);
             gp::GraphicsPath path;
-            TbRoundPath(path, ir, 10);
+            TbRoundPath(path, hb, 9);
             gp::SolidBrush b(sel ? Color(255, 229, 232, 236)
                                  : Color(255, 243, 244, 246));
             gr.FillPath(&b, &path);

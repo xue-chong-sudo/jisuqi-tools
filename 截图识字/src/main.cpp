@@ -90,6 +90,9 @@ int RunHost(const std::wstring& tessdata, const std::wstring& ini) {
 
 } // namespace
 
+// 供 view.cpp 取配置目录（g_iniPath 在匿名命名空间里，外部 TU 看不到）。
+const wchar_t* ShotIniPath() { return g_iniPath.c_str(); }
+
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     // GDI+ 必须在任何 GDI+ 对象（Graphics/Font/Brush 等）创建前初始化。
     // 结果窗的工具栏、标注提示都依赖它；不初始化会导致工具栏绘制失败、
