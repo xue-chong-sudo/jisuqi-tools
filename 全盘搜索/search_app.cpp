@@ -387,9 +387,12 @@ static bool LoadVol(const std::wstring& path, std::shared_ptr<VolView>& out, uin
         size_t dirsBegin = cur;
         bool dirsOk = true;
         for (uint64_t i = 0; i < hd.nDirs; i++) {
+            // 偏移必须落在"长度前缀"上（VolDirAt 从该处先读 2 字节长度再取字符串）。
+            // 曾经记成"字符串起点"，导致路径整体错位：路径列为空、末尾多出乱码、双击拼出的路径不存在。
+            uint32_t off = (uint32_t)(cur - dirsBegin);
             uint16_t l = 0; if (!take16(l)) { dirsOk = false; break; }
             if (cur + (size_t)l > fsize) { dirsOk = false; break; }
-            view->dirOff.push_back((uint32_t)(cur - dirsBegin));
+            view->dirOff.push_back(off);
             cur += l;
         }
         if (!dirsOk || view->dirOff.size() != (size_t)hd.nDirs) break;
@@ -432,6 +435,12 @@ static std::mutex g_statusMu;
 static std::wstring g_indexStatus;
 static void SetIndexStatus(std::wstring s) { std::lock_guard<std::mutex> lk(g_statusMu); g_indexStatus = std::move(s); }
 static std::wstring GetIndexStatus() { std::lock_guard<std::mutex> lk(g_statusMu); return g_indexStatus; }
+// 后台重扫期间临时占用状态栏，出作用域即复位。
+// 修复：以前重扫只写不复位，跑完就永久停在"正在建立索引：C: (40000 个)"，看起来像一直在建索引。
+struct StatusScope {
+    explicit StatusScope(std::wstring s) { SetIndexStatus(std::move(s)); }
+    ~StatusScope() { SetIndexStatus(L"索引已就绪"); }
+};
 static std::wstring GetExeDir() {
     wchar_t buf[MAX_PATH + 2] = {};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -459,6 +468,11 @@ static std::wstring GenPath(wchar_t letter, uint32_t g) {
     return IdxBase(letter) + L".g" + std::to_wstring(g) + L".idx";
 }
 static std::wstring ManifestPath(wchar_t letter) { return IdxBase(letter) + L".manifest"; }
+// "manifest 根本不存在" vs "文件在但读不出来"。前者是首次建立/被清缓存，可以从空开始写；
+// 后者必须放弃本次写入并重试（否则会用旧副本覆盖别人的提交）。
+static bool ManifestMissing(wchar_t letter) {
+    return GetFileAttributesW(ManifestPath(letter).c_str()) == INVALID_FILE_ATTRIBUTES;
+}
 // 下一代编号：现存 g 文件的最大编号 +1（永不复用，避免撞上仍被映射的旧文件）
 static uint32_t NextGen(wchar_t letter) {
     uint32_t mx = 0;
@@ -474,22 +488,32 @@ static uint32_t NextGen(wchar_t letter) {
     return mx + 1;
 }
 // 把构建好的片发布为新代次文件，返回文件名（失败返回空）
+// 发布时用来"往前推"代次号：清缓存后旧代次处于 delete-pending（目录里看不见、但名字还被占），
+// 只靠 NextGen 扫目录会算出同一个名字，于是永远撞名、永远发布失败。这里用一个只增不减的提示值兜住。
+static std::atomic<uint32_t> g_genHint[26];
 static std::wstring PublishShard(wchar_t letter, VolBuild& b, uint64_t buildTime) {
-    uint32_t ng = NextGen(letter);
-    std::wstring target = GenPath(letter, ng);
-    std::wstring tmp = target + L".tmp";
+    // 固定临时名（不以 .idx 结尾，不会被 manifest/GC 当作代次文件）
+    std::wstring tmp = CacheDir() + L"\\vol_" + std::wstring(1, letter) + L".publish.tmp";
     if (!SaveVol(tmp, b, buildTime)) { DeleteFileW(tmp.c_str()); return {}; }
-    bool moved = false;
-    for (int a = 0; a < 3 && !moved; ++a) {
-        if (a) Sleep(200);
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        uint32_t mx = NextGen(letter);
+        uint32_t hint = ++g_genHint[letter - 'A'];
+        uint32_t ng = mx > hint ? mx : hint;
+        std::wstring target = GenPath(letter, ng);
+        if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) continue;   // 名字已被占：换下一个
         // 刻意【不带】MOVEFILE_REPLACE_EXISTING：代次文件名本就不该已存在。
-        // 万一撞名（NextGen 被改坏 / 出现第二个发布者），宁可这里失败并保持脏重试，
-        // 也不要静默覆盖一个可能仍被在飞搜索结果映射着的旧代次。
-        moved = MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        // 万一撞名，宁可失败换号重试，也不要静默覆盖一个可能仍被在飞搜索结果映射着的旧代次。
+        if (MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            const wchar_t* name = wcsrchr(target.c_str(), L'\\');
+            return name ? std::wstring(name + 1) : target;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS && err != ERROR_FILE_EXISTS &&
+            err != ERROR_ACCESS_DENIED && err != ERROR_SHARING_VIOLATION) break;
+        Sleep(40);
     }
-    if (!moved) { DeleteFileW(tmp.c_str()); return {}; }
-    const wchar_t* name = wcsrchr(target.c_str(), L'\\');
-    return name ? std::wstring(name + 1) : target;
+    DeleteFileW(tmp.c_str());
+    return {};
 }
 
 struct ShardSpec { std::wstring rel; std::wstring path; bool hot = false; };   // rel 小写相对路径，""=卷根片
@@ -793,8 +817,8 @@ static void WalkShard(wchar_t letter, const std::wstring& rootPath, const std::v
                 if (!pruned) stack.push_back({ full + L"\\", self, false });
             }
             if (++count % 20000 == 0) {
-                wchar_t b[96];
-                swprintf(b, 96, L"正在建立索引：%c: (%llu 个)", (wchar_t)letter, (unsigned long long)count);
+                wchar_t b[320];
+                swprintf(b, 320, L"正在扫描 %ls (%llu 个)", rootNoSlash.c_str(), (unsigned long long)count);
                 SetIndexStatus(b);
             }
         } while (FindNextFileW(h, &fd) && !st.stop_requested());
@@ -830,6 +854,7 @@ static bool RescanShard(wchar_t letter, int k, std::stop_token st) {
     }
     std::vector<std::wstring> prune = PruneFor(letter, k);
     std::wstring rootPath = spec.path.empty() ? (std::wstring(1, letter) + L":") : spec.path;
+    StatusScope statusGuard(L"正在更新索引：" + rootPath);
     std::wstring file;
     uint64_t nRecs = 0, nDirs = 0, buildTime = 0;
     {
@@ -852,8 +877,12 @@ static bool RescanShard(wchar_t letter, int k, std::stop_token st) {
         std::lock_guard<std::mutex> lk2(g_shardMu);
         int i = letter - 'A';
         std::vector<ShardEntry> es;
-        // 读不到 manifest 就不能写：否则会拿内存里的旧副本重写，覆盖掉别的线程刚提交的条目（丢更新 + 孤儿文件）
-        if (!LoadManifest(letter, es)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); return false; }
+        // manifest 不存在 = 首次建立（或刚被"刷新"清掉）：从空开始写，否则永远建不出 manifest
+        // （曾经的 bug：清理后每片建好就因"读不到 manifest"被删，无限循环、界面一直显示正在建索引）
+        if (!LoadManifest(letter, es)) {
+            if (!ManifestMissing(letter)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); return false; }
+            es.clear();
+        }
         bool found = false;
         for (auto& e : es) {
             if (e.rel == spec.rel) {
@@ -1169,7 +1198,11 @@ static void IndexerThread(std::stop_token st) {
                 {   // 以磁盘 manifest 为准做读-改-写（不在内存里长期持有引用，避免刷新时被清空）
                     std::lock_guard<std::mutex> lk2(g_shardMu);
                     std::vector<ShardEntry> cur;
-                    if (!LoadManifest(letter, cur)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); continue; }
+                    if (!LoadManifest(letter, cur)) {
+                        // 文件在但读不出 → 放弃本次提交（避免覆盖别人的提交）；文件不存在 → 从空开始建
+                        if (!ManifestMissing(letter)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); continue; }
+                        cur.clear();
+                    }
                     bool found = false;
                     for (auto& e : cur) {
                         if (e.rel == spec.rel) {
