@@ -482,8 +482,10 @@ static std::wstring PublishShard(wchar_t letter, VolBuild& b, uint64_t buildTime
     bool moved = false;
     for (int a = 0; a < 3 && !moved; ++a) {
         if (a) Sleep(200);
-        moved = MoveFileExW(tmp.c_str(), target.c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        // 刻意【不带】MOVEFILE_REPLACE_EXISTING：代次文件名本就不该已存在。
+        // 万一撞名（NextGen 被改坏 / 出现第二个发布者），宁可这里失败并保持脏重试，
+        // 也不要静默覆盖一个可能仍被在飞搜索结果映射着的旧代次。
+        moved = MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
     }
     if (!moved) { DeleteFileW(tmp.c_str()); return {}; }
     const wchar_t* name = wcsrchr(target.c_str(), L'\\');
@@ -495,10 +497,15 @@ struct ShardEntry { std::wstring rel, path, file; uint64_t nRecs = 0, nDirs = 0,
 // 片级状态：只在 g_shardMu 保护下读写（监听线程与调度线程共用）
 struct ShardState {
     bool     dirty = false;
-    uint64_t dirtyTimeMs = 0;
+    uint32_t dirtySeq = 0;       // 每次标脏自增；重扫成功后只在 seq 未变时才清脏（避免吞掉重扫期间的新事件）
+    uint64_t dirtyTimeMs = 0;    // 最近一次变化
+    uint64_t firstDirtyMs = 0;   // 本轮首次变化（防止持续 churn 让防抖永远不满足）
+    bool     busy = false;       // 正在重扫（防止同片重复排队）
     uint64_t lastRescanMs = 0;
 };
+static const uint64_t MAX_DEBOUNCE_WAIT_MS = 30ull * 1000;   // 持续变化也要在 30s 内扫一次
 static std::mutex              g_shardMu;
+static std::atomic<uint32_t>   g_cacheEpoch{ 0 };   // 手动刷新（F5）会 ++，索引线程据此放弃本轮构建
 static std::vector<ShardSpec>  g_shards[26];
 static std::vector<ShardEntry> g_manifest[26];
 static std::vector<ShardState> g_shardState[26];
@@ -603,11 +610,18 @@ static bool WriteManifest(wchar_t letter, const std::vector<ShardEntry>& es) {
 static bool LoadManifest(wchar_t letter, std::vector<ShardEntry>& out) {
     out.clear();
     std::wstring p = ManifestPath(letter);
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, p.c_str(), L"rb") || !f) return false;
-    std::string all; char buf[4096]; size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
-    fclose(f);
+    // 用全共享方式打开：否则本进程的读句柄会挡住 manifest 的原子替换（MoveFileEx 失败 → 更新发不出去）
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::string all; char buf[4096]; DWORD got = 0;
+    for (;;) {
+        if (!ReadFile(h, buf, sizeof buf, &got, nullptr) || got == 0) break;
+        all.append(buf, got);
+    }
+    CloseHandle(h);
+    if (all.empty()) return false;
     std::wstring text = U8(all);
     size_t pos = 0; bool verOk = false;
     while (pos < text.size()) {
@@ -680,7 +694,22 @@ static void RebuildSnapshotFromManifests() {
         for (auto& e : es) {
             std::shared_ptr<VolView> v;
             uint64_t bt = 0;
-            if (!LoadVol(CacheDir() + L"\\" + e.file, v, bt)) continue;
+            if (!LoadVol(CacheDir() + L"\\" + e.file, v, bt)) {
+                // 片文件缺失/损坏：不能静默跳过（否则该子树永久搜不到），标记重建
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                auto& states = g_shardState[i];
+                auto& specs = g_shards[i];
+                for (int k = 0; k < (int)specs.size() && k < (int)states.size(); k++) {
+                    if (specs[(size_t)k].rel == e.rel) {
+                        uint64_t nowMs = GetTickCount64();
+                        if (!states[(size_t)k].dirty) states[(size_t)k].firstDirtyMs = nowMs;
+                        states[(size_t)k].dirty = true;
+                        states[(size_t)k].dirtyTimeMs = nowMs;
+                        break;
+                    }
+                }
+                continue;
+            }
             v->shardRel = e.rel;
             v->isRootShard = e.rel.empty();
             ns->push_back(v);
@@ -789,13 +818,14 @@ static void ReloadIndexFromCache() {
 }
 
 // 重建一个片：只遍历该片子树 → 发布新代次文件 → 换 manifest 里对应条目（manifest 是提交点）。
-static void RescanShard(wchar_t letter, int k, std::stop_token st) {
+// 返回 true 表示"发布 + manifest 提交"都成功；false 时调用方必须保持脏，稍后重试（不能静默丢更新）。
+static bool RescanShard(wchar_t letter, int k, std::stop_token st) {
     std::lock_guard<std::mutex> lk(g_rescanMu);   // C6：同一时刻只允许一个片在重扫
     EnsureShards(letter);
     ShardSpec spec;
     {
         std::lock_guard<std::mutex> lk2(g_shardMu);
-        if (k < 0 || k >= (int)g_shards[letter - 'A'].size()) return;
+        if (k < 0 || k >= (int)g_shards[letter - 'A'].size()) return false;
         spec = g_shards[letter - 'A'][(size_t)k];
     }
     std::vector<std::wstring> prune = PruneFor(letter, k);
@@ -806,7 +836,7 @@ static void RescanShard(wchar_t letter, int k, std::stop_token st) {
         // 构建对象独立作用域：出作用域先析构，之后 _heapmin 才能真把内存还给系统
         VolBuild b; b.letter = letter;
         WalkShard(letter, rootPath, prune, b, st);
-        if (st.stop_requested()) return;
+        if (st.stop_requested()) return false;
         TrimVol(b);
         FILETIME f{}; GetSystemTimeAsFileTime(&f);
         buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
@@ -814,29 +844,56 @@ static void RescanShard(wchar_t letter, int k, std::stop_token st) {
         nRecs = b.recs.size(); nDirs = b.dirs.size();
     }
     _heapmin();
-    if (file.empty()) return;
+    if (file.empty()) return false;
+    bool committed = false;
+    uint64_t prevRecs = 0;
+    bool hadEntry = false;
     {   // 换 manifest 条目（读-改-写，全部在 g_shardMu 下）
         std::lock_guard<std::mutex> lk2(g_shardMu);
         int i = letter - 'A';
         std::vector<ShardEntry> es;
-        if (!LoadManifest(letter, es)) es = g_manifest[i];
+        // 读不到 manifest 就不能写：否则会拿内存里的旧副本重写，覆盖掉别的线程刚提交的条目（丢更新 + 孤儿文件）
+        if (!LoadManifest(letter, es)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); return false; }
         bool found = false;
         for (auto& e : es) {
             if (e.rel == spec.rel) {
+                prevRecs = e.nRecs; hadEntry = true;
                 e.path = spec.path; e.file = file;
                 e.nRecs = nRecs; e.nDirs = nDirs; e.buildTime = buildTime;
                 found = true; break;
             }
         }
         if (!found) es.push_back({ spec.rel, spec.path, file, nRecs, nDirs, buildTime });
-        WriteManifest(letter, es);
-        g_manifest[i] = es;
+        if (WriteManifest(letter, es)) {              // 只有 manifest 落盘成功才算提交
+            g_manifest[i] = es;
+            committed = true;
+        } else {
+            DeleteFileW((CacheDir() + L"\\" + file).c_str());   // 提交失败：删掉刚发布的文件，不留孤儿
+        }
     }
+    if (!committed) return false;
     GcGenerations();                              // 旧代次若仍被在飞结果映射，删不掉也无妨（下次启动再清）
+    // 片「由非空变空」（片根被删/改名）：父片里那条指向该目录的记录会变成幽灵，标记父片重建一次。
+    // 注意判据是"原来非空"，不是"本次为 0"——Documents/Downloads 这类本来就空的片不能每次变化都放大成父片重建。
+    if (nRecs == 0 && hadEntry && prevRecs > 0 && !spec.rel.empty()) {
+        size_t bs = spec.rel.rfind(L'\\');
+        std::wstring parentRel = (bs == std::wstring::npos) ? std::wstring() : spec.rel.substr(0, bs);
+        int pk = ShardOfPath(letter, parentRel);
+        std::lock_guard<std::mutex> lk2(g_shardMu);
+        auto& states = g_shardState[letter - 'A'];
+        if (pk >= 0 && pk < (int)states.size()) {
+            uint64_t nowMs = GetTickCount64();
+            if (!states[(size_t)pk].dirty) states[(size_t)pk].firstDirtyMs = nowMs;
+            states[(size_t)pk].dirty = true;
+            states[(size_t)pk].dirtyTimeMs = nowMs;
+            ++states[(size_t)pk].dirtySeq;
+        }
+    }
     if (g_visible.load()) {
         RebuildSnapshotFromManifests();           // 16 个 mmap ≈ 1–2ms
         if (g_hwnd) PostMessageW(g_hwnd, WM_APP_RESCAN_DONE, 0, 0);
     }
+    return true;
 }
 
 // 每盘一个同步监听线程：只标脏，绝不在此重扫。
@@ -879,7 +936,7 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
                 {
                     std::lock_guard<std::mutex> lk2(g_shardMu);
                     uint64_t nowMs = GetTickCount64();
-                    for (auto& s2 : g_shardState[idx]) { s2.dirty = true; s2.dirtyTimeMs = nowMs; }
+                    for (auto& s2 : g_shardState[idx]) { s2.dirty = true; s2.dirtyTimeMs = nowMs; ++s2.dirtySeq; }
                 }
                 break;
             }
@@ -893,7 +950,13 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
                     auto* fni = (FILE_NOTIFY_INFORMATION*)p;
                     std::wstring path(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
                     for (auto& c : path) c = (wchar_t)towlower(c);
-                    if (ignore.empty() || path.rfind(ignore, 0) != 0) { any = true; paths.push_back(path); }
+                    // 忽略本程序自身 data 目录（idx/manifest 写入），但必须按路径边界比较，
+                    // 否则 "...\data2" 这类同前缀目录会被误忽略。
+                    bool self = false;
+                    if (!ignore.empty() && path.size() >= ignore.size() &&
+                        path.compare(0, ignore.size(), ignore) == 0 &&
+                        (path.size() == ignore.size() || path[ignore.size()] == L'\\')) self = true;
+                    if (!self) { any = true; paths.push_back(path); }
                     if (fni->NextEntryOffset == 0) break;
                     p += fni->NextEntryOffset;
                 }
@@ -906,15 +969,21 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
                 auto& states = g_shardState[idx];
                 if (states.empty()) continue;
                 if (paths.empty()) {                      // 缓冲区溢出：整盘片全部标脏
-                    for (auto& s2 : states) { s2.dirty = true; s2.dirtyTimeMs = nowMs; }
+                    for (auto& s2 : states) {
+                        if (!s2.dirty) s2.firstDirtyMs = nowMs;
+                        s2.dirty = true; s2.dirtyTimeMs = nowMs; ++s2.dirtySeq;
+                    }
                 } else {
                     for (auto& rel : paths) {
-                        size_t bs = rel.rfind(L'\\');
-                        std::wstring dirRel = (bs == std::wstring::npos) ? std::wstring() : rel.substr(0, bs);
-                        int k2 = ShardOfPath(letter, dirRel);
+                        // 用"变化项自身的路径"做最长前缀匹配：文件落在其所属片；
+                        // 若变化的正是某个片根目录（被删/改名），也能命中该片，从而让该片重建（可能变成空片）。
+                        int k2 = ShardOfPath(letter, rel);
                         if (k2 < 0 || k2 >= (int)states.size()) continue;
-                        states[(size_t)k2].dirty = true;
-                        states[(size_t)k2].dirtyTimeMs = nowMs;
+                        auto& st2 = states[(size_t)k2];
+                        if (!st2.dirty) st2.firstDirtyMs = nowMs;   // 只在"从干净变脏"时记首变时间
+                        st2.dirty = true;
+                        st2.dirtyTimeMs = nowMs;
+                        ++st2.dirtySeq;
                     }
                 }
             }
@@ -942,23 +1011,41 @@ static void SchedulerThread(std::stop_token st) {
             if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
             EnsureShards(letter);
             int done = -1;
+            uint32_t doneSeq = 0;
             {
                 std::lock_guard<std::mutex> lk2(g_shardMu);
                 auto& states = g_shardState[i];
                 const auto& specs = g_shards[i];
                 for (int k = 0; k < (int)states.size(); k++) {
                     auto& vs = states[(size_t)k];
-                    if (!vs.dirty) continue;
-                    if (now - vs.dirtyTimeMs < DEBOUNCE_MS) continue;
+                    if (!vs.dirty || vs.busy) continue;
+                    // 防抖：静了 8s 才扫；但持续 churn 时不能无限等，首变超过 30s 也强扫一次
+                    bool quiet = (now - vs.dirtyTimeMs >= DEBOUNCE_MS);
+                    bool overdue = (vs.firstDirtyMs != 0 && now - vs.firstDirtyMs >= MAX_DEBOUNCE_WAIT_MS);
+                    if (!quiet && !overdue) continue;
                     uint64_t floorMs = specs[(size_t)k].hot ? HOT_MIN_INTERVAL_MS : COLD_MIN_INTERVAL_MS;
                     if (now - vs.lastRescanMs < floorMs) continue;
-                    vs.dirty = false;
+                    vs.busy = true;
                     vs.lastRescanMs = now;
                     done = k;
+                    doneSeq = vs.dirtySeq;       // 记下开始重扫时的变化序号
                     break;                       // 一次只重扫一片（串行，C6）
                 }
             }
-            if (done >= 0) RescanShard(letter, done, st);
+            if (done >= 0) {
+                bool okr = RescanShard(letter, done, st);
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                auto& vs = g_shardState[i][(size_t)done];
+                vs.busy = false;
+                // 只有"重扫期间没有新事件"且成功时才清脏；否则保留脏标记，让下一轮再补一次
+                if (okr && vs.dirtySeq == doneSeq) {
+                    vs.dirty = false;
+                } else {
+                    vs.dirtyTimeMs = GetTickCount64();
+                    vs.firstDirtyMs = vs.dirtyTimeMs;
+                    ++vs.dirtySeq;               // 重置序号，便于下一轮判定
+                }
+            }
         }
         for (int k = 0; k < 5 && !st.stop_requested(); k++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1003,6 +1090,7 @@ static void ClearIndexCache() {
     }
     std::lock_guard<std::mutex> lk2(g_shardMu);
     for (int i = 0; i < 26; i++) g_manifest[i].clear();
+    ++g_cacheEpoch;   // 让索引线程放弃正在进行的构建，回到外层重新开始
 }
 
 static void IndexerThread(std::stop_token st) {
@@ -1026,32 +1114,42 @@ static void IndexerThread(std::stop_token st) {
             if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
             EnsureShards(letter);
             // 先按现有 manifest 出结果（分片已存在就直接用，不再全量扫）
-            std::vector<ShardEntry> es;
-            bool haveMf = LoadManifest(letter, es);
-            bool allFresh = haveMf;
-            {
-                FILETIME f{}; GetSystemTimeAsFileTime(&f);
-                uint64_t now = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
-                for (auto& e : es) {
-                    if (GetFileAttributesW((CacheDir() + L"\\" + e.file).c_str()) == INVALID_FILE_ATTRIBUTES) { allFresh = false; break; }
-                    if (!(e.buildTime > 0 && now - e.buildTime < STARTUP_STALE_TICKS)) { allFresh = false; break; }
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lk2(g_shardMu);
-                g_manifest[i] = es;
-            }
-            if (allFresh) { RebuildSnapshotFromManifests(); continue; }
-            // 需要（首次）建分片：逐片构建，每片落盘即发布，边建边可用
-            std::lock_guard<std::mutex> rl(g_rescanMu);   // C6：与调度线程串行化
             std::vector<ShardSpec> specs;
             {
                 std::lock_guard<std::mutex> lk2(g_shardMu);
                 specs = g_shards[i];
             }
+            std::vector<ShardEntry> es;
+            bool haveMf = LoadManifest(letter, es);
+            {
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                g_manifest[i] = es;
+            }
+            FILETIME ft{}; GetSystemTimeAsFileTime(&ft);
+            uint64_t nowTicks = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+            // 逐片判定"可复用"：文件在 + buildTime 在 24h 内 + manifest 里有条目。
+            // 缺任何一条（例如上次建索引中途退出、漏了一片）都要重建——否则该子树会永久搜不到。
+            auto needBuild = [&](const ShardSpec& s) -> bool {
+                if (!haveMf) return true;
+                for (auto& e : es) {
+                    if (e.rel != s.rel) continue;
+                    if (GetFileAttributesW((CacheDir() + L"\\" + e.file).c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+                    if (!(e.buildTime > 0 && nowTicks - e.buildTime < STARTUP_STALE_TICKS)) return true;
+                    return false;
+                }
+                return true;
+            };
+            bool anyNeed = false;
+            for (auto& s : specs) if (needBuild(s)) { anyNeed = true; break; }
+            if (!anyNeed) { RebuildSnapshotFromManifests(); continue; }
+            // 逐片构建，每片落盘即发布，边建边可用
+            std::lock_guard<std::mutex> rl(g_rescanMu);   // C6：与调度线程串行化
+            const uint32_t myEpoch = g_cacheEpoch.load();
             for (int k = 0; k < (int)specs.size(); k++) {
                 if (st.stop_requested()) return;
+                if (g_cacheEpoch.load() != myEpoch) break;   // 用户按了刷新：放弃本轮，回外层重来
                 const ShardSpec spec = specs[(size_t)k];
+                if (!needBuild(spec)) continue;
                 std::vector<std::wstring> prune = PruneFor(letter, k);
                 std::wstring rootPath = spec.path.empty() ? (std::wstring(1, letter) + L":") : spec.path;
                 std::wstring file;
@@ -1068,19 +1166,21 @@ static void IndexerThread(std::stop_token st) {
                 }
                 _heapmin();   // 每片建完就压实：峰值只跟单片大小有关
                 if (file.empty()) continue;
-                {
+                {   // 以磁盘 manifest 为准做读-改-写（不在内存里长期持有引用，避免刷新时被清空）
                     std::lock_guard<std::mutex> lk2(g_shardMu);
-                    auto& mf = g_manifest[i];
+                    std::vector<ShardEntry> cur;
+                    if (!LoadManifest(letter, cur)) { DeleteFileW((CacheDir() + L"\\" + file).c_str()); continue; }
                     bool found = false;
-                    for (auto& e : mf) {
+                    for (auto& e : cur) {
                         if (e.rel == spec.rel) {
                             e.path = spec.path; e.file = file;
                             e.nRecs = nRecs; e.nDirs = nDirs; e.buildTime = buildTime;
                             found = true; break;
                         }
                     }
-                    if (!found) mf.push_back({ spec.rel, spec.path, file, nRecs, nDirs, buildTime });
-                    WriteManifest(letter, mf);
+                    if (!found) cur.push_back({ spec.rel, spec.path, file, nRecs, nDirs, buildTime });
+                    if (WriteManifest(letter, cur)) g_manifest[i] = cur;
+                    else DeleteFileW((CacheDir() + L"\\" + file).c_str());   // 提交失败：不留孤儿
                 }
                 RebuildSnapshotFromManifests();   // 这一片立即可搜
                 wchar_t sb[96];
