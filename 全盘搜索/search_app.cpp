@@ -91,8 +91,6 @@ static std::wstring CacheDir();
 struct Rec; struct Res; struct VolBuild; struct VolView;
 static bool SaveVol(const std::wstring&, const VolBuild&, uint64_t);
 static bool LoadVol(const std::wstring&, std::shared_ptr<VolView>&, uint64_t&);
-static void CommitVol(std::shared_ptr<VolView>);
-static void WalkVolume(wchar_t, VolBuild&, std::stop_token);
 static void IndexerThread(std::stop_token);
 static void RequestSearch();
 static void SearcherThread(std::stop_token);
@@ -225,6 +223,8 @@ struct VolView {
     const uint8_t* nameBlob = nullptr;  uint64_t nameLen = 0;
     const uint8_t* lowerBlob = nullptr; uint64_t lowerLen = 0;
     std::vector<uint32_t> dirOff;          // 每个目录在 dirsBlob 内的偏移
+    std::wstring shardRel;                 // P2：本片相对路径（小写，""=卷根片）
+    bool isRootShard = false;               // P2：「仅显示顶层」只认卷根片里 parent==0 的记录
 };
 using Snapshot = std::vector<std::shared_ptr<VolView>>;
 static std::atomic<std::shared_ptr<Snapshot>> g_snap{ std::make_shared<Snapshot>() };
@@ -235,16 +235,7 @@ static bool              g_wasHidden = false;       // 曾经被 WM_CLOSE 隐藏
 static std::mutex        g_listenMu;
 static HANDLE            g_listenHandle[26] = {};    // 监听线程真实句柄（CancelSynchronousIo 用）
 static HANDLE            g_listenThreadH[26] = {};   // CreateThread 句柄（join 用）
-static std::mutex        g_rescanMu;                 // C6：全局串行化重扫（IndexerThread + 调度线程）
-static const DWORD       DEBOUNCE_MS = 8000;
-static const uint64_t    VISIBLE_MIN_INTERVAL_MS = 5ull * 60 * 1000;   // 可见期也限 5 分钟：C 盘一次扫描约 1 分钟，间隔太短会变成持续扫描
-static const uint64_t    HIDDEN_MIN_INTERVAL_MS = 5ull * 60 * 1000;
-struct VolWatch {
-    std::atomic<bool>     dirty{ false };
-    std::atomic<uint64_t> dirtyTimeMs{ 0 };
-    std::atomic<uint64_t> lastRescanMs{ 0 };
-};
-static VolWatch g_volWatch[26];
+static std::mutex        g_rescanMu;                 // C6：全局串行化重扫（一次只重扫一个片）
 static const size_t MAX_STORED = 50000;
 
 // ---------------- string helpers ----------------
@@ -458,35 +449,19 @@ static std::wstring DataRoot() {
 }
 static std::wstring CacheDir() { return DataRoot() + L"\\cache"; }
 
-// ---- 索引发布：代次文件 + 指针 ----
-// Windows 上不能覆盖或删除"本进程正在 mmap 的文件"：沿用"覆盖 vol_X.idx"会让
-// 重扫结果永远发布不出去（MoveFileEx 失败、只留 .tmp）。所以改成：
-//   写新文件 vol_X.g<N>.idx（永不覆盖）→ 小指针文件 vol_X.cur 原子切换指向它。
+// ================= P2：分片索引（manifest 为唯一提交点） =================
+// 每个盘切成若干"片"，每片一个独立 idx 文件；一份 vol_X.manifest 记录当前各片的文件。
+// 更新只重写变化的那一片 → 重扫峰值只和该片大小有关；热片可以高频重建（30 秒）。
+// Windows 上不能覆盖/删除本进程正在 mmap 的文件 → 每次发布都写新的代次文件
+// （vol_X.g<N>.idx），换文件只改 manifest（manifest 本身不被映射，可原子替换）。
 static std::wstring IdxBase(wchar_t letter) { return CacheDir() + L"\\vol_" + std::wstring(1, letter); }
 static std::wstring GenPath(wchar_t letter, uint32_t g) {
     return IdxBase(letter) + L".g" + std::to_wstring(g) + L".idx";
 }
-static uint32_t ReadCurGen(wchar_t letter) {
-    std::wstring p = IdxBase(letter) + L".cur";
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, p.c_str(), L"rb") || !f) return 0;
-    unsigned g = 0;
-    if (fwscanf(f, L"%u", &g) != 1) g = 0;
-    fclose(f);
-    return (uint32_t)g;
-}
-// 当前应加载的索引文件（无指针/文件缺失时退回旧的单文件 vol_X.idx）
-static std::wstring CurIdxPath(wchar_t letter) {
-    uint32_t g = ReadCurGen(letter);
-    if (g) {
-        std::wstring p = GenPath(letter, g);
-        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
-    }
-    return IdxBase(letter) + L".idx";
-}
-// 下一代编号：取"指针值与现存 g 文件编号"的最大者 +1，保证永不复用已存在的文件
+static std::wstring ManifestPath(wchar_t letter) { return IdxBase(letter) + L".manifest"; }
+// 下一代编号：现存 g 文件的最大编号 +1（永不复用，避免撞上仍被映射的旧文件）
 static uint32_t NextGen(wchar_t letter) {
-    uint32_t mx = ReadCurGen(letter);
+    uint32_t mx = 0;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((IdxBase(letter) + L".g*.idx").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -498,23 +473,8 @@ static uint32_t NextGen(wchar_t letter) {
     }
     return mx + 1;
 }
-static bool WriteCurGen(wchar_t letter, uint32_t g) {
-    std::wstring p = IdxBase(letter) + L".cur";
-    std::wstring t = p + L".tmp";
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, t.c_str(), L"wb") || !f) return false;
-    fwprintf(f, L"%u\n", g);
-    fflush(f); _commit(_fileno(f)); fclose(f);
-    bool ok = false;
-    for (int a = 0; a < 3 && !ok; ++a) {
-        if (a) Sleep(200);
-        ok = MoveFileExW(t.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-    }
-    if (!ok) DeleteFileW(t.c_str());
-    return ok;
-}
-// 把构建好的索引发布为新一代并返回新路径（失败返回空）
-static std::wstring PublishVol(wchar_t letter, VolBuild& b, uint64_t buildTime) {
+// 把构建好的片发布为新代次文件，返回文件名（失败返回空）
+static std::wstring PublishShard(wchar_t letter, VolBuild& b, uint64_t buildTime) {
     uint32_t ng = NextGen(letter);
     std::wstring target = GenPath(letter, ng);
     std::wstring tmp = target + L".tmp";
@@ -526,63 +486,215 @@ static std::wstring PublishVol(wchar_t letter, VolBuild& b, uint64_t buildTime) 
                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
     }
     if (!moved) { DeleteFileW(tmp.c_str()); return {}; }
-    if (!WriteCurGen(letter, ng)) return {};     // 指针没切成功 = 未发布
-    return target;
+    const wchar_t* name = wcsrchr(target.c_str(), L'\\');
+    return name ? std::wstring(name + 1) : target;
 }
-// 启动期 GC（此时没有任何视图存活）：清掉旧代次、旧单文件、残留 .tmp
+
+struct ShardSpec { std::wstring rel; std::wstring path; bool hot = false; };   // rel 小写相对路径，""=卷根片
+struct ShardEntry { std::wstring rel, path, file; uint64_t nRecs = 0, nDirs = 0, buildTime = 0; };
+// 片级状态：只在 g_shardMu 保护下读写（监听线程与调度线程共用）
+struct ShardState {
+    bool     dirty = false;
+    uint64_t dirtyTimeMs = 0;
+    uint64_t lastRescanMs = 0;
+};
+static std::mutex              g_shardMu;
+static std::vector<ShardSpec>  g_shards[26];
+static std::vector<ShardEntry> g_manifest[26];
+static std::vector<ShardState> g_shardState[26];
+static const DWORD             DEBOUNCE_MS = 8000;
+static const uint64_t          HOT_MIN_INTERVAL_MS  = 30ull * 1000;        // 热片：30 秒
+static const uint64_t          COLD_MIN_INTERVAL_MS = 5ull * 60 * 1000;    // 冷片：5 分钟
+
+// 决定一个盘的切片方案：卷根 + Windows 大头 + 每个用户账户的热区。
+// 依据本机实测分布（C: 42 万条里 Windows\servicing 15.5 万、WinSxS 8.9 万、Users 10.6 万），
+// 目标是"任一片重建峰值 ≤ 30MB"，同时把天天变的热区独立出来。
+static void EnsureShards(wchar_t letter) {
+    std::lock_guard<std::mutex> lk(g_shardMu);
+    int i = letter - 'A';
+    if (!g_shards[i].empty()) return;
+    auto& v = g_shards[i];
+    v.push_back({ L"", L"", false });
+    std::wstring drv(1, letter); drv += L":";
+    auto add = [&](const std::wstring& path, bool hot) {
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+        v.push_back({ LowerW(path.substr(3)), path, hot });
+    };
+    add(drv + L"\\Windows\\servicing", false);
+    add(drv + L"\\Windows\\WinSxS", false);
+    add(drv + L"\\Windows\\System32", false);
+    add(drv + L"\\Windows", false);
+    // 用户热区（多账户机器上按实际存在的账户展开，而不是写死 administrator）
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((drv + L"\\Users\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            std::wstring base = drv + L"\\Users\\" + fd.cFileName;
+            add(base + L"\\AppData\\Roaming", true);
+            add(base + L"\\AppData\\Local", true);
+            add(base + L"\\AppData\\LocalLow", true);
+            add(base + L"\\Desktop", true);
+            add(base + L"\\Documents", true);
+            add(base + L"\\Downloads", true);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(v.begin(), v.end(), [](const ShardSpec& a, const ShardSpec& b) { return a.rel < b.rel; });
+    g_shardState[i].assign(v.size(), ShardState{});
+}
+// 一条路径（小写相对路径）属于哪一片：取最长的匹配前缀
+static int ShardOfPath(wchar_t letter, const std::wstring& relLower) {
+    int i = letter - 'A';
+    int best = 0; size_t bestLen = 0;
+    for (int k = 0; k < (int)g_shards[i].size(); k++) {
+        const auto& s = g_shards[i][k];
+        if (s.rel.empty()) continue;
+        if (relLower.size() < s.rel.size()) continue;
+        if (relLower.compare(0, s.rel.size(), s.rel) != 0) continue;
+        if (relLower.size() != s.rel.size() && relLower[s.rel.size()] != L'\\') continue;
+        if (s.rel.size() > bestLen) { bestLen = s.rel.size(); best = k; }
+    }
+    return best;
+}
+// 遍历某个盘时要"剪掉"的另一批片根（避免父子片重复收录）
+static std::vector<std::wstring> PruneFor(wchar_t letter, int self) {
+    std::vector<std::wstring> out;
+    int i = letter - 'A';
+    const auto& mine = g_shards[i][(size_t)self].rel;
+    for (int k = 0; k < (int)g_shards[i].size(); k++) {
+        if (k == self) continue;
+        const auto& s = g_shards[i][k].rel;
+        if (s.empty()) continue;
+        if (s.size() <= mine.size()) continue;
+        if (mine.empty() || (s.compare(0, mine.size(), mine) == 0 && s[mine.size()] == L'\\'))
+            out.push_back(s);
+    }
+    return out;
+}
+
+// ---- manifest 读写（唯一提交点）----
+static bool WriteManifest(wchar_t letter, const std::vector<ShardEntry>& es) {
+    std::wstring p = ManifestPath(letter);
+    std::wstring t = p + L".tmp";
+    // 一律写 UTF-8 字节流（fwprintf 会把宽字符写成 UTF-16，读端按 UTF-8 解析就会失败）
+    std::string out = "v1\n";
+    for (auto& e : es) {
+        out += "shard\t" + W8(e.rel) + "\t" + W8(e.path) + "\t" + W8(e.file) + "\t" +
+               std::to_string((unsigned long long)e.nRecs) + "\t" +
+               std::to_string((unsigned long long)e.nDirs) + "\t" +
+               std::to_string((unsigned long long)e.buildTime) + "\n";
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, t.c_str(), L"wb") || !f) return false;
+    bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
+    if (ok) { fflush(f); _commit(_fileno(f)); }
+    fclose(f);
+    if (!ok) { DeleteFileW(t.c_str()); return false; }
+    bool moved = false;
+    for (int a = 0; a < 3 && !moved; ++a) {
+        if (a) Sleep(200);
+        moved = MoveFileExW(t.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    }
+    if (!moved) DeleteFileW(t.c_str());
+    return moved;
+}
+static bool LoadManifest(wchar_t letter, std::vector<ShardEntry>& out) {
+    out.clear();
+    std::wstring p = ManifestPath(letter);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, p.c_str(), L"rb") || !f) return false;
+    std::string all; char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
+    fclose(f);
+    std::wstring text = U8(all);
+    size_t pos = 0; bool verOk = false;
+    while (pos < text.size()) {
+        size_t nl = text.find(L'\n', pos);
+        if (nl == std::wstring::npos) nl = text.size();
+        std::wstring line = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == L'v' && line.size() <= 3) { verOk = true; continue; }
+        // shard \t rel \t path \t file \t nRecs \t nDirs \t buildTime
+        std::vector<std::wstring> f2;
+        size_t s = 0;
+        for (;;) {
+            size_t t2 = line.find(L'\t', s);
+            f2.push_back(line.substr(s, (t2 == std::wstring::npos) ? std::wstring::npos : t2 - s));
+            if (t2 == std::wstring::npos) break;
+            s = t2 + 1;
+        }
+        if (f2.size() < 7 || f2[0] != L"shard") continue;
+        ShardEntry e;
+        e.rel = f2[1]; e.path = f2[2]; e.file = f2[3];
+        e.nRecs = wcstoull(f2[4].c_str(), nullptr, 10);
+        e.nDirs = wcstoull(f2[5].c_str(), nullptr, 10);
+        e.buildTime = wcstoull(f2[6].c_str(), nullptr, 10);
+        out.push_back(std::move(e));
+    }
+    return verOk && !out.empty();
+}
+// 启动期 GC（此时没有任何视图存活）：删掉 manifest 未引用的代次文件、旧单文件、.cur、残留 tmp
+// 注意：读不出 manifest 时【绝不删任何 idx】——否则会把刚发布的分片全清掉（曾经真踩过）。
 static void GcGenerations() {
     for (int i = 0; i < 26; i++) {
         wchar_t letter = (wchar_t)('A' + i);
-        uint32_t g = ReadCurGen(letter);
-        std::wstring keep;
-        if (g) {
-            std::wstring p = GenPath(letter, g);
-            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) keep = L"vol_" + std::wstring(1, letter) + L".g" + std::to_wstring(g) + L".idx";
+        std::vector<ShardEntry> es;
+        bool haveMf = LoadManifest(letter, es);
+        if (haveMf) {
+            auto referenced = [&](const std::wstring& name) {
+                for (auto& e : es) if (_wcsicmp(e.file.c_str(), name.c_str()) == 0) return true;
+                return false;
+            };
+            WIN32_FIND_DATAW fd{};
+            HANDLE h = FindFirstFileW((IdxBase(letter) + L".g*.idx").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (referenced(fd.cFileName)) continue;
+                    DeleteFileW((CacheDir() + L"\\" + std::wstring(fd.cFileName)).c_str());
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+            DeleteFileW((IdxBase(letter) + L".idx").c_str());   // 旧单文件索引退休
+            DeleteFileW((IdxBase(letter) + L".cur").c_str());
         }
-        WIN32_FIND_DATAW fd{};
-        HANDLE h = FindFirstFileW((IdxBase(letter) + L".g*.idx").c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (!keep.empty() && _wcsicmp(fd.cFileName, keep.c_str()) == 0) continue;
-                DeleteFileW((CacheDir() + L"\\" + std::wstring(fd.cFileName)).c_str());
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-        if (!keep.empty())   // 已发布新一代 → 旧的单文件索引可以退休
-            DeleteFileW((IdxBase(letter) + L".idx").c_str());
-        h = FindFirstFileW((IdxBase(letter) + L".*.tmp").c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do { DeleteFileW((CacheDir() + L"\\" + std::wstring(fd.cFileName)).c_str()); }
-            while (FindNextFileW(h, &fd));
-            FindClose(h);
+        WIN32_FIND_DATAW fd2{};
+        HANDLE h2 = FindFirstFileW((IdxBase(letter) + L".*.tmp").c_str(), &fd2);
+        if (h2 != INVALID_HANDLE_VALUE) {
+            do { DeleteFileW((CacheDir() + L"\\" + std::wstring(fd2.cFileName)).c_str()); }
+            while (FindNextFileW(h2, &fd2));
+            FindClose(h2);
         }
     }
 }
-
-static void CommitVol(std::shared_ptr<VolView> v) {
-    auto cur = g_snap.load();
-    auto ns = std::make_shared<Snapshot>(*cur);
-    bool found = false;
-    for (auto& e : *ns) if (e->letter == v->letter) { e = v; found = true; break; }
-    if (!found) ns->push_back(v);
-    std::sort(ns->begin(), ns->end(), [](auto& a, auto& b) { return a->letter < b->letter; });
+// 按所有盘的 manifest 重建内存快照（每片一个 mmap 视图；总代价约 1–2ms）
+static void RebuildSnapshotFromManifests() {
+    auto ns = std::make_shared<Snapshot>();
+    for (int i = 0; i < 26; i++) {
+        wchar_t letter = (wchar_t)('A' + i);
+        std::vector<ShardEntry> es;
+        if (!LoadManifest(letter, es)) continue;
+        for (auto& e : es) {
+            std::shared_ptr<VolView> v;
+            uint64_t bt = 0;
+            if (!LoadVol(CacheDir() + L"\\" + e.file, v, bt)) continue;
+            v->shardRel = e.rel;
+            v->isRootShard = e.rel.empty();
+            ns->push_back(v);
+        }
+    }
+    std::sort(ns->begin(), ns->end(), [](auto& a, auto& b) {
+        if (a->letter != b->letter) return a->letter < b->letter;
+        return a->shardRel < b->shardRel;
+    });
     g_snap.store(ns);
 }
 
-// ---- P0：按上次 idx 头部记录数预分配 + 构建后回收多余容量 ----
-static void ReserveFromIdx(const std::wstring& idxPath, VolBuild& v) {
-    HANDLE h = CreateFileW(idxPath.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    IdxHead hd{}; DWORD got = 0;
-    if (ReadFile(h, &hd, sizeof hd, &got, nullptr) && got == sizeof hd &&
-        memcmp(hd.magic, IDX_MAGIC, 8) == 0) {
-        v.recs.reserve((size_t)(hd.nRecs + hd.nRecs / 5) + 64);
-        v.dirs.reserve((size_t)(hd.nDirs + hd.nDirs / 5) + 64);
-    }
-    CloseHandle(h);
-}
+
+// ---- 构建后回收多余容量（P2 后每片重建体积小且频繁，压容量比预分配更重要）----
 static void TrimVol(VolBuild& v) {
     if (v.recs.capacity() > v.recs.size() + v.recs.size() / 20) v.recs.shrink_to_fit();
     if (v.dirs.capacity() > v.dirs.size() + v.dirs.size() / 20) v.dirs.shrink_to_fit();
@@ -591,15 +703,21 @@ static void TrimVol(VolBuild& v) {
     v.subtreeEnd.shrink_to_fit();
 }
 
-static void WalkVolume(wchar_t letter, VolBuild& v, std::stop_token st) {
+// 构建一个片：只遍历 rootPath 这一棵子树，跳过 prune 里的其它片根（避免父子片重复收录）。
+// dirs[0] = 本片根目录的绝对路径；片根自身的目录记录归父片所有（父片负责显示/打开它）。
+static void WalkShard(wchar_t letter, const std::wstring& rootPath, const std::vector<std::wstring>& pruneLower,
+                      VolBuild& v, std::stop_token st) {
     v.letter = letter;
     v.ver = 2;
-    std::wstring root;
-    root.push_back(letter); root += L":\\";
-    v.dirs.push_back(root.substr(0, 2)); // dirs[0] = "C:"
+    v.parentPath.clear();
+    std::wstring root = rootPath;
+    if (root.empty() || root.back() != L'\\') root += L'\\';       // 扫描用（带尾斜杠）
+    std::wstring rootNoSlash = root.substr(0, root.size() - 1);    // 显示用
+    v.dirs.push_back(rootNoSlash);                                 // dirs[0] = 片根
     v.subtreeEnd.clear();
     std::vector<uint32_t> dirParent;     // 临时：目录父下标（用于算 subtreeEnd）
     dirParent.push_back(0);
+    std::unordered_set<std::wstring> prune(pruneLower.begin(), pruneLower.end());
     struct Q { std::wstring path; uint32_t parent; bool isRoot; };
     std::vector<Q> stack;
     stack.push_back({ root, 0, true });
@@ -636,10 +754,18 @@ static void WalkVolume(wchar_t letter, VolBuild& v, std::stop_token st) {
             r.cat = isDir ? (uint8_t)CAT_DIR : (uint8_t)ClassifyExt(ExtOf(wname));
             v.nameBlob.append(u8); v.lowerBlob.append(u8l);
             v.recs.push_back(r);
-            if (isDir) stack.push_back({ cur.path + nm + L"\\", self, false });
+            if (isDir) {
+                std::wstring full = cur.path + nm;
+                bool pruned = false;
+                if (!prune.empty() && full.size() > 3) {
+                    std::wstring rel = LowerW(full.substr(3));
+                    pruned = prune.find(rel) != prune.end();
+                }
+                if (!pruned) stack.push_back({ full + L"\\", self, false });
+            }
             if (++count % 20000 == 0) {
-                wchar_t b[80];
-                swprintf(b, 80, L"正在建立索引：%c: (%llu 个文件)", (wchar_t)letter, (unsigned long long)count);
+                wchar_t b[96];
+                swprintf(b, 96, L"正在建立索引：%c: (%llu 个)", (wchar_t)letter, (unsigned long long)count);
                 SetIndexStatus(b);
             }
         } while (FindNextFileW(h, &fd) && !st.stop_requested());
@@ -653,55 +779,64 @@ static void WalkVolume(wchar_t letter, VolBuild& v, std::stop_token st) {
         uint32_t p = dirParent[i];
         if (v.subtreeEnd[i] > v.subtreeEnd[p]) v.subtreeEnd[p] = v.subtreeEnd[i];
     }
-    v.parentPath.clear();   // 整卷片：无外部父路径
 }
 
 // ---------------- Phase1：监听 / 调度 / 重扫 ----------------
 
-// 从磁盘缓存重载全部固定盘索引（隐藏时快照已置空，窗口重新显示时调用）。
+// 从磁盘上的 manifest 重载全部片（隐藏时快照已置空，窗口重新显示时调用）。
 static void ReloadIndexFromCache() {
-    auto ns = std::make_shared<Snapshot>();
-    DWORD drives = GetLogicalDrives();
-    for (int i = 0; i < 26; i++) {
-        if (!(drives & (1u << i))) continue;
-        wchar_t letter = (wchar_t)('A' + i);
-        wchar_t root[4] = { letter, L':', L'\\', 0 };
-        if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
-        std::wstring idxPath = CurIdxPath(letter);
-        std::shared_ptr<VolView> v;
-        uint64_t bt = 0;
-        if (LoadVol(idxPath, v, bt)) ns->push_back(v);
-    }
-    std::sort(ns->begin(), ns->end(), [](auto& a, auto& b) { return a->letter < b->letter; });
-    g_snap.store(ns);
+    RebuildSnapshotFromManifests();
 }
 
-// 单卷重扫：WalkVolume 构建 → 原子写盘 → 可见时切内存快照并通知 UI 重搜。
-static void RescanVolume(wchar_t letter, int idx, std::stop_token st) {
-    std::lock_guard<std::mutex> lk(g_rescanMu);   // C6：同一时刻只允许一个卷在重扫
-    std::wstring idxPath = CurIdxPath(letter);
-    std::wstring published;
+// 重建一个片：只遍历该片子树 → 发布新代次文件 → 换 manifest 里对应条目（manifest 是提交点）。
+static void RescanShard(wchar_t letter, int k, std::stop_token st) {
+    std::lock_guard<std::mutex> lk(g_rescanMu);   // C6：同一时刻只允许一个片在重扫
+    EnsureShards(letter);
+    ShardSpec spec;
     {
-        // 构建对象放在独立作用域：出了作用域立刻析构（约 100MB），
-        // 之后才能通过 _heapmin 把空堆段还给系统。放在外面压实等于白压。
+        std::lock_guard<std::mutex> lk2(g_shardMu);
+        if (k < 0 || k >= (int)g_shards[letter - 'A'].size()) return;
+        spec = g_shards[letter - 'A'][(size_t)k];
+    }
+    std::vector<std::wstring> prune = PruneFor(letter, k);
+    std::wstring rootPath = spec.path.empty() ? (std::wstring(1, letter) + L":") : spec.path;
+    std::wstring file;
+    uint64_t nRecs = 0, nDirs = 0, buildTime = 0;
+    {
+        // 构建对象独立作用域：出作用域先析构，之后 _heapmin 才能真把内存还给系统
         VolBuild b; b.letter = letter;
-        ReserveFromIdx(idxPath, b);
-        WalkVolume(letter, b, st);
+        WalkShard(letter, rootPath, prune, b, st);
         if (st.stop_requested()) return;
         TrimVol(b);
         FILETIME f{}; GetSystemTimeAsFileTime(&f);
-        uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
-        published = PublishVol(letter, b, buildTime);   // 新代次文件，不覆盖已映射文件
+        buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
+        file = PublishShard(letter, b, buildTime);
+        nRecs = b.recs.size(); nDirs = b.dirs.size();
     }
-    _heapmin();                                  // 构建对象已析构：把空段还给系统
-    if (g_visible.load() && !published.empty()) {
-        std::shared_ptr<VolView> view; uint64_t bt2 = 0;
-        if (LoadVol(published, view, bt2)) {            // 落盘后重新 mmap，构建对象可释放
-            CommitVol(view);
-            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_RESCAN_DONE, 0, 0);
+    _heapmin();
+    if (file.empty()) return;
+    {   // 换 manifest 条目（读-改-写，全部在 g_shardMu 下）
+        std::lock_guard<std::mutex> lk2(g_shardMu);
+        int i = letter - 'A';
+        std::vector<ShardEntry> es;
+        if (!LoadManifest(letter, es)) es = g_manifest[i];
+        bool found = false;
+        for (auto& e : es) {
+            if (e.rel == spec.rel) {
+                e.path = spec.path; e.file = file;
+                e.nRecs = nRecs; e.nDirs = nDirs; e.buildTime = buildTime;
+                found = true; break;
+            }
         }
+        if (!found) es.push_back({ spec.rel, spec.path, file, nRecs, nDirs, buildTime });
+        WriteManifest(letter, es);
+        g_manifest[i] = es;
     }
-    if (!published.empty()) GcGenerations();             // 旧代次若仍被在飞结果映射，删不掉也无妨（下次启动再清）
+    GcGenerations();                              // 旧代次若仍被在飞结果映射，删不掉也无妨（下次启动再清）
+    if (g_visible.load()) {
+        RebuildSnapshotFromManifests();           // 16 个 mmap ≈ 1–2ms
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_RESCAN_DONE, 0, 0);
+    }
 }
 
 // 每盘一个同步监听线程：只标脏，绝不在此重扫。
@@ -740,11 +875,16 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
             if (!ok) {
                 DWORD err = GetLastError();
                 if (err == ERROR_OPERATION_ABORTED) break;   // 被 CancelSynchronousIo 打断
-                g_volWatch[idx].dirty = true;                // 其他错误：标脏后退出，由调度兜底
-                g_volWatch[idx].dirtyTimeMs = GetTickCount64();
+                EnsureShards(letter);                         // 其他错误：整盘片标脏后退出，由调度兜底
+                {
+                    std::lock_guard<std::mutex> lk2(g_shardMu);
+                    uint64_t nowMs = GetTickCount64();
+                    for (auto& s2 : g_shardState[idx]) { s2.dirty = true; s2.dirtyTimeMs = nowMs; }
+                }
                 break;
             }
             bool any = false;
+            std::vector<std::wstring> paths;   // 本次事件涉及的相对路径（小写）
             if (bytes == 0) {
                 any = true;                                  // 溢出：无法判断路径，保守标脏
             } else {
@@ -753,14 +893,30 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
                     auto* fni = (FILE_NOTIFY_INFORMATION*)p;
                     std::wstring path(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
                     for (auto& c : path) c = (wchar_t)towlower(c);
-                    if (ignore.empty() || path.rfind(ignore, 0) != 0) { any = true; break; }
+                    if (ignore.empty() || path.rfind(ignore, 0) != 0) { any = true; paths.push_back(path); }
                     if (fni->NextEntryOffset == 0) break;
                     p += fni->NextEntryOffset;
                 }
             }
             if (any) {
-                g_volWatch[idx].dirty = true;
-                g_volWatch[idx].dirtyTimeMs = GetTickCount64();
+                // P2：按变化路径落到具体片，只给那一片标脏（热片 30 秒就能重扫完）
+                EnsureShards(letter);
+                uint64_t nowMs = GetTickCount64();
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                auto& states = g_shardState[idx];
+                if (states.empty()) continue;
+                if (paths.empty()) {                      // 缓冲区溢出：整盘片全部标脏
+                    for (auto& s2 : states) { s2.dirty = true; s2.dirtyTimeMs = nowMs; }
+                } else {
+                    for (auto& rel : paths) {
+                        size_t bs = rel.rfind(L'\\');
+                        std::wstring dirRel = (bs == std::wstring::npos) ? std::wstring() : rel.substr(0, bs);
+                        int k2 = ShardOfPath(letter, dirRel);
+                        if (k2 < 0 || k2 >= (int)states.size()) continue;
+                        states[(size_t)k2].dirty = true;
+                        states[(size_t)k2].dirtyTimeMs = nowMs;
+                    }
+                }
             }
         }
         CloseHandle(hDir);
@@ -773,7 +929,7 @@ static DWORD WINAPI ListenerProc(LPVOID param) {
     return 0;
 }
 
-// 全局唯一调度线程：防抖后串行重扫；隐藏期加最小间隔，可见期不加。
+// 全局唯一调度线程：按片独立计时——热片 30 秒、冷片 5 分钟（防高频变更把重扫打成死循环）。
 static void SchedulerThread(std::stop_token st) {
     while (!st.stop_requested()) {
         uint64_t now = GetTickCount64();
@@ -784,15 +940,25 @@ static void SchedulerThread(std::stop_token st) {
             wchar_t letter = (wchar_t)('A' + i);
             wchar_t root[4] = { letter, L':', L'\\', 0 };
             if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
-            auto& vs = g_volWatch[i];
-            if (!vs.dirty.load()) continue;
-            if (now - vs.dirtyTimeMs.load() < DEBOUNCE_MS) continue;
-            bool vis = g_visible.load();
-            uint64_t floorMs = vis ? VISIBLE_MIN_INTERVAL_MS : HIDDEN_MIN_INTERVAL_MS;
-            if (now - vs.lastRescanMs.load() < floorMs) continue;
-            vs.dirty = false;
-            vs.lastRescanMs = now;
-            RescanVolume(letter, i, st);
+            EnsureShards(letter);
+            int done = -1;
+            {
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                auto& states = g_shardState[i];
+                const auto& specs = g_shards[i];
+                for (int k = 0; k < (int)states.size(); k++) {
+                    auto& vs = states[(size_t)k];
+                    if (!vs.dirty) continue;
+                    if (now - vs.dirtyTimeMs < DEBOUNCE_MS) continue;
+                    uint64_t floorMs = specs[(size_t)k].hot ? HOT_MIN_INTERVAL_MS : COLD_MIN_INTERVAL_MS;
+                    if (now - vs.lastRescanMs < floorMs) continue;
+                    vs.dirty = false;
+                    vs.lastRescanMs = now;
+                    done = k;
+                    break;                       // 一次只重扫一片（串行，C6）
+                }
+            }
+            if (done >= 0) RescanShard(letter, done, st);
         }
         for (int k = 0; k < 5 && !st.stop_requested(); k++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -824,9 +990,9 @@ static std::condition_variable g_refreshCv;
 static int                     g_refreshSeq = 0;
 
 static void ClearIndexCache() {
-    // 代次文件 vol_X.gN.idx、指针 vol_X.cur、旧单文件 vol_X.idx、残留 tmp 一并清掉。
+    // 代次文件 vol_X.gN.idx、manifest、旧单文件、残留 tmp 一并清掉。
     // 注意：被 mmap 的旧代次这里删不掉（设计如此），启动期 GcGenerations 会兜底清理。
-    for (const wchar_t* pat : { L"\\vol_*.idx", L"\\vol_*.cur", L"\\vol_*.tmp" }) {
+    for (const wchar_t* pat : { L"\\vol_*.idx", L"\\vol_*.manifest", L"\\vol_*.cur", L"\\vol_*.tmp" }) {
         WIN32_FIND_DATAW fd{};
         std::wstring p = CacheDir() + pat;
         HANDLE hFind = FindFirstFileW(p.c_str(), &fd);
@@ -835,6 +1001,8 @@ static void ClearIndexCache() {
         while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
+    std::lock_guard<std::mutex> lk2(g_shardMu);
+    for (int i = 0; i < 26; i++) g_manifest[i].clear();
 }
 
 static void IndexerThread(std::stop_token st) {
@@ -856,43 +1024,71 @@ static void IndexerThread(std::stop_token st) {
             wchar_t letter = (wchar_t)('A' + i);
             wchar_t root[4] = { letter, L':', L'\\', 0 };
             if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+            EnsureShards(letter);
+            // 先按现有 manifest 出结果（分片已存在就直接用，不再全量扫）
+            std::vector<ShardEntry> es;
+            bool haveMf = LoadManifest(letter, es);
+            bool allFresh = haveMf;
+            {
+                FILETIME f{}; GetSystemTimeAsFileTime(&f);
+                uint64_t now = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
+                for (auto& e : es) {
+                    if (GetFileAttributesW((CacheDir() + L"\\" + e.file).c_str()) == INVALID_FILE_ATTRIBUTES) { allFresh = false; break; }
+                    if (!(e.buildTime > 0 && now - e.buildTime < STARTUP_STALE_TICKS)) { allFresh = false; break; }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                g_manifest[i] = es;
+            }
+            if (allFresh) { RebuildSnapshotFromManifests(); continue; }
+            // 需要（首次）建分片：逐片构建，每片落盘即发布，边建边可用
             std::lock_guard<std::mutex> rl(g_rescanMu);   // C6：与调度线程串行化
-            // load existing?
-            std::wstring idxPath = CurIdxPath(letter);
-            uint64_t bt = 0;
-            std::shared_ptr<VolView> loaded;
-            bool have = LoadVol(idxPath, loaded, bt);
-            uint64_t now = 0;
+            std::vector<ShardSpec> specs;
             {
-                FILETIME f{}; GetSystemTimeAsFileTime(&f);
-                now = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
+                std::lock_guard<std::mutex> lk2(g_shardMu);
+                specs = g_shards[i];
             }
-            // 先用缓存立即出结果（即便略旧），避免"启动空白等扫描"。
-            if (have) CommitVol(loaded);
-            // P1a：旧格式(ver<2)先用旧缓存出结果，但后台强制重建为 ver=2（首次启动会全量重建）。
-            bool needUpgrade = have && loaded->ver < 2;
-            if (needUpgrade) {
-                wchar_t ub[64];
-                swprintf(ub, 64, L"正在升级索引格式：%c:", (wchar_t)letter);
-                SetIndexStatus(ub);
-            }
-            // 缓存足够新（24 小时内且已是新格式）就不重扫；否则后台重扫刷新。
-            if (!needUpgrade && have && bt > 0 && now - bt < STARTUP_STALE_TICKS) continue;
-            // rebuild（构建对象放独立作用域：出作用域先析构，再压实才能真的把内存还给系统）
-            std::wstring published;
-            {
-                VolBuild b; b.letter = letter;
-                ReserveFromIdx(idxPath, b);
-                WalkVolume(letter, b, st);
+            for (int k = 0; k < (int)specs.size(); k++) {
                 if (st.stop_requested()) return;
-                TrimVol(b);
-                FILETIME f{}; GetSystemTimeAsFileTime(&f);
-                uint64_t buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
-                published = PublishVol(letter, b, buildTime);
+                const ShardSpec spec = specs[(size_t)k];
+                std::vector<std::wstring> prune = PruneFor(letter, k);
+                std::wstring rootPath = spec.path.empty() ? (std::wstring(1, letter) + L":") : spec.path;
+                std::wstring file;
+                uint64_t nRecs = 0, nDirs = 0, buildTime = 0;
+                {
+                    VolBuild b; b.letter = letter;
+                    WalkShard(letter, rootPath, prune, b, st);
+                    if (st.stop_requested()) return;
+                    TrimVol(b);
+                    FILETIME f{}; GetSystemTimeAsFileTime(&f);
+                    buildTime = ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime;
+                    file = PublishShard(letter, b, buildTime);
+                    nRecs = b.recs.size(); nDirs = b.dirs.size();
+                }
+                _heapmin();   // 每片建完就压实：峰值只跟单片大小有关
+                if (file.empty()) continue;
+                {
+                    std::lock_guard<std::mutex> lk2(g_shardMu);
+                    auto& mf = g_manifest[i];
+                    bool found = false;
+                    for (auto& e : mf) {
+                        if (e.rel == spec.rel) {
+                            e.path = spec.path; e.file = file;
+                            e.nRecs = nRecs; e.nDirs = nDirs; e.buildTime = buildTime;
+                            found = true; break;
+                        }
+                    }
+                    if (!found) mf.push_back({ spec.rel, spec.path, file, nRecs, nDirs, buildTime });
+                    WriteManifest(letter, mf);
+                }
+                RebuildSnapshotFromManifests();   // 这一片立即可搜
+                wchar_t sb[96];
+                swprintf(sb, 96, L"正在建立分片索引：%c: %d/%d",
+                         (wchar_t)letter, k + 1, (int)specs.size());
+                SetIndexStatus(sb);
             }
-            _heapmin();   // 释放构建期占用的堆段（/MT 下不压实会残留约 4MB）
-            std::shared_ptr<VolView> nv; uint64_t bt2 = 0;
-            if (!published.empty() && LoadVol(published, nv, bt2)) CommitVol(nv);
+            GcGenerations();
             SetIndexStatus(L"索引已更新：" + std::wstring(1, letter) + L":");
             if (g_curEpoch > 0) RequestSearch();   // re-run with fresh data
         }
@@ -1010,7 +1206,11 @@ static void SearcherThread(std::stop_token st) {
                     if (!r.scopeDir.empty()) {
                         if (parent >= vol->nDirs || !allowed[parent]) continue;
                         if (!r.sub && !eqScope[parent]) continue;
-                    } else if (!r.sub && parent != 0) continue;
+                    } else if (!r.sub) {
+                        // P2：「仅显示顶层」= 卷根片里 parent==0 的记录（各盘一级目录）。
+                        // 热区片/Windows 片的根目录本身仍由卷根片的记录显示，不重复。
+                        if (!vol->isRootShard || parent != 0) continue;
+                    }
                     std::string_view low((const char*)lb + lowerOff, lowerLen);
                     bool ok = true;
                     for (auto& k : kw8)
