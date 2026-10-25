@@ -191,6 +191,10 @@ static std::thread             g_worker;
 static std::once_flag          g_workerOnce;
 
 static void OcrWorkerLoop() {
+    // OCR 是纯 CPU 密集的活（整屏图能跑满所有核心好几秒）。降到"低于正常"，
+    // 否则紧接着的下一次截图要拷屏 + 抹黑遮罩，会被 OCR 抢 CPU 拖成好几秒才出来
+    // （用户反馈的"截完一张要等 10 秒才能再截"就是这个）。
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         std::shared_ptr<OcrJob> job;
         {

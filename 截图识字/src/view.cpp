@@ -771,14 +771,15 @@ void TbPaintBar(gp::Graphics& gr, int cw, int ch) {
             pen.SetLineJoin(gp::LineJoinRound);
             int t = (sem < 14) ? (sem - 9) : AT_TEXT;
             if (sem == 15) {
-                // 「下载」：向下的箭头 + 下方托盘。托盘是个方括号形状，
-                // 两个下角用圆弧过渡（用户明确要求），笔帽圆头所以两端也圆。
-                PointF tip(cx, ir.Y + 26);
-                gr.DrawLine(&pen, PointF(cx, ir.Y + 9), tip);
-                gr.DrawLine(&pen, PointF(cx - 6.5f, ir.Y + 19.5f), tip);
-                gr.DrawLine(&pen, PointF(cx + 6.5f, ir.Y + 19.5f), tip);
-                const float bx0 = cx - 9.5f, bx1 = cx + 9.5f;
-                const float bTop = ir.Y + 28.0f, bBot = ir.Y + 34.5f, rr = 4.0f;
+                // 「下载」：向下的箭头 + 下方托盘。托盘是个横向的方括号，
+                // 两个下角用圆弧过渡、两端圆头。托盘做宽一点，整个图标才接近正方形
+                // （用户反馈：原来托盘太窄，图标看着像竖长方形）。
+                PointF tip(cx, ir.Y + 25);
+                gr.DrawLine(&pen, PointF(cx, ir.Y + 10), tip);
+                gr.DrawLine(&pen, PointF(cx - 7.5f, ir.Y + 18.5f), tip);
+                gr.DrawLine(&pen, PointF(cx + 7.5f, ir.Y + 18.5f), tip);
+                const float bx0 = cx - 11.0f, bx1 = cx + 11.0f;
+                const float bTop = ir.Y + 27.0f, bBot = ir.Y + 33.5f, rr = 4.5f;
                 gp::GraphicsPath tray;
                 tray.AddLine(bx0, bTop, bx0, bBot - rr);
                 tray.AddArc(bx0, bBot - 2 * rr, 2 * rr, 2 * rr, 180, -90);
