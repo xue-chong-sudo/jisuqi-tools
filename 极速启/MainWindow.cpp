@@ -136,10 +136,32 @@ struct MenuItemText {
 static std::vector<MenuItemText> g_menuText;   // itemData 存下标
 static int  g_menuDpi = 96;
 static HFONT g_menuFont = nullptr;
+// 临时覆盖"文字到左右边框"的内边距（像素）。>0 时优先于默认值。
+// 托盘菜单要求"以最长一项为准、左右各留两个字"，由 MenuCharsWidth(2) 算出后设置。
+static int  g_menuPadPx = 0;
 
 // 文字到左右边框的距离：系统默认菜单左侧内边距约 20px，取一半并左右一致。
 static int MenuPadX() {
+    if (g_menuPadPx > 0) return g_menuPadPx;
     return static_cast<int>(10 * (g_menuDpi / 96.0));
+}
+
+// 菜单字体下 n 个汉字的宽度（用于"左右各留两个字"这类按字计的间距）。
+static HFONT MenuFont();   // 定义在后面
+static int MenuCharsWidth(int n) {
+    int w = 0;
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, MenuFont());
+        std::wstring s(static_cast<size_t>(n), L'\u4E2D');   // 「中」= 标准汉字宽
+        SIZE sz; ZeroMemory(&sz, sizeof(sz));
+        GetTextExtentPoint32W(dc, s.c_str(), n, &sz);
+        w = sz.cx;
+        SelectObject(dc, old);
+        ReleaseDC(nullptr, dc);
+    }
+    if (w <= 0) w = static_cast<int>(14 * n * (g_menuDpi / 96.0));
+    return w;
 }
 
 static HFONT MenuFont() {
@@ -1427,6 +1449,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                     PostMessageW(m_hwnd, WM_APP_TOGGLE, 0, 0);
             }
             if (wp == TIMER_HOOKCHECK) { m_app->ReinstallMouseHook(); }  // 鼠标钩子看门狗：定期重装自愈
+            if (wp == TIMER_TRIM) {      // 隐藏 3 秒后：把工作集还给系统（内存占用回落）
+                KillTimer(m_hwnd, TIMER_TRIM);
+                if (!IsWindowVisible(m_hwnd))
+                    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            }
             if (wp == TIMER_TOPMOST) {   // 置顶看门狗：面板可见但置顶样式丢失时自动补回
                 if (IsWindowVisible(m_hwnd) &&
                     !(GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
@@ -1444,6 +1471,7 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             KillTimer(m_hwnd, TIMER_AUTOHIDE);
+            KillTimer(m_hwnd, TIMER_TRIM);
             if (m_drop) {
                 RevokeDragDrop(m_hwnd);
                 if (m_editSearch) RevokeDragDrop(m_editSearch);
@@ -2235,6 +2263,7 @@ static void ForceForeground(HWND h) {
 
 void MainWindow::Show() {
     AllowSetForegroundWindow(ASFW_ANY);
+    KillTimer(m_hwnd, TIMER_TRIM);   // 又要显示了：取消待执行的"隐藏后回收工作集"
 
     // ① 确认 WS_EX_TOPMOST 扩展样式在位（若运行时被意外摘掉，就地补回）。
     LONG_PTR ex = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
@@ -2303,6 +2332,11 @@ void MainWindow::Hide() {
         RebuildVisible();
     }
     ShowWindow(m_hwnd, SW_HIDE);
+    // 面板常驻、但多数时间并不显示：隐藏 3 秒后把工作集还给系统
+    // （任务管理器「内存」列会掉到 1MB 量级）。只回收工作集、不动已提交内存，
+    // 因此不影响任何功能；再次呼出时页面从 standby 取回，基本无感。
+    // 用延迟定时器而不是立刻回收：连续呼出/隐藏时不会反复抖动。
+    SetTimer(m_hwnd, TIMER_TRIM, 3000, nullptr);
 }
 
 bool MainWindow::IsVisible() const {
@@ -3740,17 +3774,19 @@ void MainWindow::ShowTrayMenu() {
     // 括号内显示当前状态：（关）= 正常可用，（开）= 已暂停；点击切换。
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu) return;
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW, L"显示窗口");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"设置");
+    // 系统菜单不能设宽度，只能自绘：按最长一项算宽，左右各留"两个字"的内边距。
+    g_menuText.clear();
+    g_menuDpi = m_dpi;
+    g_menuPadPx = MenuCharsWidth(2);
+    AddMenuText(hMenu, ID_TRAY_SHOW, L"显示窗口");
+    AddMenuText(hMenu, ID_TRAY_SETTINGS, L"设置");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING | (g_pauseHotkey ? MF_CHECKED : 0),
-                ID_TRAY_PAUSE_HOTKEY,
+    AddMenuText(hMenu, ID_TRAY_PAUSE_HOTKEY,
                 g_pauseHotkey ? L"暂停使用快捷键（开）" : L"暂停使用快捷键（关）");
-    AppendMenuW(hMenu, MF_STRING | (g_pauseMouse ? MF_CHECKED : 0),
-                ID_TRAY_PAUSE_MOUSE,
+    AddMenuText(hMenu, ID_TRAY_PAUSE_MOUSE,
                 g_pauseMouse ? L"暂停使用鼠标（开）" : L"暂停使用鼠标（关）");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出(&D)");
+    AddMenuText(hMenu, ID_TRAY_EXIT, L"退出(D)");
 
     POINT pt = {0, 0};
     GetCursorPos(&pt);
@@ -3758,6 +3794,7 @@ void MainWindow::ShowTrayMenu() {
     SetForegroundWindow(m_hwnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
                    pt.x, pt.y, 0, m_hwnd, nullptr);
+    g_menuPadPx = 0;          // 恢复默认内边距，别影响其它菜单
     DestroyMenu(hMenu);
 }
 
