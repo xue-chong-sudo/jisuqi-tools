@@ -3772,46 +3772,354 @@ int MainWindow::TabRectAt(POINT pt) const {
     return -1;
 }
 
+// ===== 托盘菜单：自绘弹窗 =====
+// 为什么不用 HMENU：
+//   1) 系统弹出菜单右侧固定预留一列（96dpi 约 55px、120dpi 约 72px），没有任何 API
+//      能去掉它 —— 用户要的「右边和左边一样近」用系统菜单做不到；
+//   2) 换成 owner-draw 更糟：行宽行高由我们上报，系统还会再补一段（实测 +46px），
+//      行高也不采纳我们的值，于是出现「有的项缩进、末项被裁、右边更宽」。
+// 所以自己开一个 WS_POPUP 窗口：左右内边距严格相等，行高自定，悬停高亮自绘，
+// 按键由本窗口处理（弹出前 SetForegroundWindow，拿到焦点后 D/Esc/回车才有效）。
+struct TrayMenuEntry {
+    UINT id;                // 0 = 分隔线
+    std::wstring text;      // 显示文字（不含 &）
+    wchar_t mnemonic;       // 0 = 没有
+};
+
+
+static const wchar_t kTrayMenuClass[] = L"JisuQiTrayMenu";
+static std::vector<TrayMenuEntry> g_trayItems;
+static int   g_trayDpi   = 96;
+static int   g_trayPadX  = 8;    // 左 = 右
+static int   g_trayRowH  = 22;
+static int   g_traySepH  = 8;
+static int   g_trayTop   = 4;    // 上下内边距
+static int   g_trayW     = 0;
+static int   g_trayH     = 0;
+static int   g_trayHot   = -1;   // 悬停/键盘选中项
+static HWND  g_trayWnd   = nullptr;
+static HWND  g_trayMain  = nullptr;   // 主窗口（命令投递目标）
+static HHOOK g_trayKeyHook = nullptr;  // 菜单打开期间的键盘钩子
+static bool  g_trayDone  = false;
+static UINT  g_trayChosen = 0;
+static DWORD g_trayOpenTick = 0;
+
+static int TrayRowHeight(size_t i) {
+    return g_trayItems[i].id == 0 ? g_traySepH : g_trayRowH;
+}
+
+// 返回命中的项下标；分隔线或空白返回 -1。
+static int TrayHitTest(int y) {
+    int y0 = g_trayTop;
+    for (size_t i = 0; i < g_trayItems.size(); ++i) {
+        const int h = TrayRowHeight(i);
+        if (y >= y0 && y < y0 + h)
+            return g_trayItems[i].id == 0 ? -1 : static_cast<int>(i);
+        y0 += h;
+    }
+    return -1;
+}
+
+static void TrayMeasure() {
+    int maxW = 0, textH = 0, trail = 0;
+    wchar_t lastCh = 0;
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, MenuFont());
+        for (const auto& it : g_trayItems) {
+            if (it.id == 0) continue;
+            SIZE sz;
+            ZeroMemory(&sz, sizeof(sz));
+            GetTextExtentPoint32W(dc, it.text.c_str(),
+                                  static_cast<int>(it.text.size()), &sz);
+            if (sz.cx > maxW) { maxW = sz.cx; lastCh = it.text.back(); }
+            if (sz.cy > textH) textH = sz.cy;
+        }
+        // 全角括号「）」这类字符右侧有一块字形 bearing，只按步进宽度留白会显得
+        // 右边比左边宽。把这部分扣掉，肉眼看到的左右留白才真的一样。
+        if (lastCh) {
+            ABCFLOAT abc;
+            ZeroMemory(&abc, sizeof(abc));
+            if (GetCharABCWidthsFloatW(dc, static_cast<UINT>(lastCh),
+                                       static_cast<UINT>(lastCh), &abc)) {
+                const int c = static_cast<int>(abc.abcfC + 0.5f);
+                if (c > 0) trail = c;
+            }
+        }
+        SelectObject(dc, old);
+        ReleaseDC(nullptr, dc);
+    }
+    if (textH <= 0) textH = MulDiv(15, g_trayDpi, 96);
+    g_trayPadX = MulDiv(7, g_trayDpi, 96);    // 左右各留同样多（用户要求两边一致）
+    // 行高对齐系统菜单（SM_CYMENU），否则弹窗和系统菜单的行距会明显不一样。
+    g_trayRowH = GetSystemMetrics(SM_CYMENU);
+    if (g_trayRowH < textH + 2) g_trayRowH = textH + 2;
+    g_traySepH = MulDiv(7, g_trayDpi, 96);
+    g_trayTop  = MulDiv(3, g_trayDpi, 96);
+    g_trayW = g_trayPadX * 2 + maxW - trail;
+    if (g_trayW < g_trayPadX * 2 + 40) g_trayW = g_trayPadX * 2 + 40;
+    g_trayH = g_trayTop * 2;
+    for (size_t i = 0; i < g_trayItems.size(); ++i) g_trayH += TrayRowHeight(i);
+}
+
+static void TrayPaint(HWND hw, HDC dcIn) {
+    PAINTSTRUCT ps;
+    HDC dc = dcIn ? dcIn : BeginPaint(hw, &ps);
+    RECT rc;
+    GetClientRect(hw, &rc);
+
+    HBRUSH bg = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+
+    if (g_trayHot >= 0 && g_trayHot < static_cast<int>(g_trayItems.size())) {
+        int y0 = g_trayTop;
+        for (int i = 0; i < g_trayHot; ++i) y0 += TrayRowHeight(static_cast<size_t>(i));
+        RECT hr = { 2, y0 + 1, rc.right - 2, y0 + TrayRowHeight(static_cast<size_t>(g_trayHot)) - 1 };
+        HBRUSH hb = CreateSolidBrush(RGB(0xE5, 0xF4, 0xFD));
+        FillRect(dc, &hr, hb);
+        DeleteObject(hb);
+    }
+
+    const int obm = SetBkMode(dc, TRANSPARENT);
+    const COLORREF ofg = SetTextColor(dc, RGB(0x2B, 0x2F, 0x36));
+    HGDIOBJ oldFont = SelectObject(dc, MenuFont());
+
+    int y = g_trayTop;
+    for (const auto& it : g_trayItems) {
+        const int h = it.id == 0 ? g_traySepH : g_trayRowH;
+        if (it.id == 0) {
+            // 分隔线：和文字左右对齐，不铺满整行（系统菜单也是这样缩进的）
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(0xE2, 0xE5, 0xEA));
+            HGDIOBJ op = SelectObject(dc, pen);
+            const int yl = y + h / 2;
+            MoveToEx(dc, g_trayPadX, yl, nullptr);
+            LineTo(dc, rc.right - g_trayPadX, yl);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        } else {
+            RECT r = { g_trayPadX, y, rc.right - g_trayPadX, y + h };
+            DrawTextW(dc, it.text.c_str(), -1, &r,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        y += h;
+    }
+
+    SelectObject(dc, oldFont);
+    SetTextColor(dc, ofg);
+    SetBkMode(dc, obm);
+
+    // 1px 边框（圆角由窗口 region 裁出来）
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0xC6, 0xCB, 0xD2));
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, 0, 0, rc.right, rc.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+
+    if (!dcIn) EndPaint(hw, &ps);
+}
+
+// 处理一次按键。菜单打开期间按键一律归菜单（和系统菜单一样吞掉所有键）。
+static bool TrayHandleKey(WPARAM vk) {
+    if (g_trayDone) return false;
+    if (vk == VK_ESCAPE) {
+        g_trayDone = true;
+        return true;
+    }
+    if (vk == VK_RETURN || vk == VK_SPACE) {
+        if (g_trayHot >= 0)
+            g_trayChosen = g_trayItems[static_cast<size_t>(g_trayHot)].id;
+        g_trayDone = true;
+        return true;
+    }
+    if (vk == VK_DOWN || vk == VK_UP) {
+        const int n = static_cast<int>(g_trayItems.size());
+        int i = g_trayHot;
+        for (int k = 0; k < n; ++k) {
+            i = (vk == VK_DOWN) ? (i + 1) % n : (i <= 0 ? n - 1 : i - 1);
+            if (g_trayItems[static_cast<size_t>(i)].id != 0) break;
+        }
+        if (i >= 0 && g_trayItems[static_cast<size_t>(i)].id != 0) {
+            g_trayHot = i;
+            if (g_trayWnd) InvalidateRect(g_trayWnd, nullptr, FALSE);
+        }
+        return true;
+    }
+    if (vk >= 'A' && vk <= 'Z') {          // 字母助记符（VK_A..VK_Z 与 'A'..'Z' 同值）
+        for (size_t i = 0; i < g_trayItems.size(); ++i) {
+            const wchar_t mn = g_trayItems[i].mnemonic;
+            if (mn && (mn | 0x20) == (static_cast<int>(vk) | 0x20)) {
+                g_trayChosen = g_trayItems[i].id;
+                g_trayDone = true;
+                return true;
+            }
+        }
+    }
+    return true;   // 其余键也吞掉，免得菜单开着时主窗口响应按键
+}
+
+// 收起弹窗。选中了某项就把命令投回主窗口。
+// 故意不用嵌套消息循环：弹出即返回（和系统菜单一样是非模态的），
+// 否则「退出」在嵌套循环里被处理时容易卡住主流程。
+static void TrayClose() {
+    HWND w = g_trayWnd;
+    if (!w) return;
+    g_trayWnd = nullptr;
+    if (g_trayKeyHook) {
+        UnhookWindowsHookEx(g_trayKeyHook);
+        g_trayKeyHook = nullptr;
+    }
+    if (GetCapture() == w) ReleaseCapture();
+    DestroyWindow(w);
+    if (g_trayChosen && g_trayMain) {
+        const UINT id = g_trayChosen;
+        g_trayChosen = 0;
+        PostMessageW(g_trayMain, WM_COMMAND, MAKEWPARAM(id, 0), 0);
+    }
+}
+
+// 菜单打开期间的键盘处理放在低级键盘钩子里：托盘菜单弹出时本进程不一定持有
+// 键盘焦点（焦点可能还留在主窗口或任务栏），只有 WH_KEYBOARD_LL 能稳定收到按键。
+// 菜单开着时按键一律吞掉（和系统菜单一致）。
+static LRESULT CALLBACK TrayLLKeyProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION && g_trayWnd) {
+        const KBDLLHOOKSTRUCT* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+            TrayHandleKey(k->vkCode);
+            if (g_trayDone) TrayClose();
+            return 1;
+        }
+        if (wp == WM_KEYUP || wp == WM_SYSKEYUP) return 1;
+    }
+    return CallNextHookEx(nullptr, nCode, wp, lp);
+}
+
+static LRESULT CALLBACK TrayMenuProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_MOUSEMOVE: {
+        const int idx = TrayHitTest(static_cast<short>(HIWORD(lp)));
+        if (idx != g_trayHot) {
+            g_trayHot = idx;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const int idx = TrayHitTest(static_cast<short>(HIWORD(lp)));
+        if (idx >= 0) g_trayChosen = g_trayItems[static_cast<size_t>(idx)].id;
+        g_trayDone = true;
+        TrayClose();
+        return 0;
+    }
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_MOUSEWHEEL:
+        g_trayDone = true;
+        TrayClose();
+        return 0;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (TrayHandleKey(wp) && g_trayDone) TrayClose();
+        return 0;
+    // 失去焦点 / 输入被抢 / 前台被别的窗口拿走，都要收起。弹出瞬间（<120ms）
+    // 忽略，避免激活过程中的瞬时通知把菜单自己关掉。
+    case WM_KILLFOCUS:
+    case WM_CAPTURECHANGED:
+        if (GetTickCount() - g_trayOpenTick > 120) TrayClose();
+        return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE && GetTickCount() - g_trayOpenTick > 250)
+            TrayClose();
+        return 0;
+    case WM_DESTROY:
+        // 正常收起走 TrayClose()（先卸钩子再销毁）；这里兜住"被别处连带销毁"的情况，
+        // 免得钩子留在系统里（虽然判空后等于直通，但没必要长期挂）。
+        g_trayWnd = nullptr;
+        if (g_trayKeyHook) {
+            UnhookWindowsHookEx(g_trayKeyHook);
+            g_trayKeyHook = nullptr;
+        }
+        break;
+    case WM_PAINT:
+        TrayPaint(h, nullptr);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)));
+        return TRUE;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
 void MainWindow::ShowTrayMenu() {
-    // 托盘菜单用「系统菜单」：布局（左边距、宽度、行高、悬停高亮）全部交给 Windows。
-    //
-    // 为什么不再自绘：owner-draw 项的行宽/行高要靠我们回报，而系统在实际布局时
-    // 还会按自己的 DPI/主题再补一段（本机 96dpi 实测每行多出 46px），并且行高
-    // 也不完全采纳我们回报的值 —— 结果就是「有的项缩进 18px、有的不缩进」「末项
-    // 被裁掉」「右边空一大块」这类没法靠调参数修好的错位。系统菜单没有这些问题。
-    //
-    // 两处改进保留：
-    //   1) MNS_NOCHECK —— 去掉系统为勾选标记预留的左侧空列（96dpi 约 28px），
-    //      这原本是改用自绘的唯一动机。
-    //   2) 真正的助记符 '&' —— 「退出(&D)」显示为「退出(D)」且 D 由系统菜单处理。
-    //      之前 D 没反应是因为托盘菜单弹出时本进程没有键盘焦点，键盘钩子和
-    //      WM_MENUCHAR 都收不到按键；现在交给系统菜单自己的键盘处理，必然有效。
-    HMENU hMenu = CreatePopupMenu();
-    if (!hMenu) return;
-    MENUINFO mi;
-    ZeroMemory(&mi, sizeof(mi));
-    mi.cbSize = sizeof(mi);
-    mi.fMask  = MIM_STYLE;
-    mi.dwStyle = MNS_NOCHECK;
-    SetMenuInfo(hMenu, &mi);
+    if (g_trayWnd) return;                 // 已经开着就别重复弹
+    g_trayItems.clear();
+    g_trayItems.push_back({ ID_TRAY_SHOW, L"显示窗口", 0 });
+    g_trayItems.push_back({ ID_TRAY_SETTINGS, L"设置", 0 });
+    g_trayItems.push_back({ 0, L"", 0 });
+    g_trayItems.push_back({ ID_TRAY_PAUSE_HOTKEY,
+                            g_pauseHotkey ? L"暂停快捷键（开）" : L"暂停快捷键（关）", 0 });
+    g_trayItems.push_back({ ID_TRAY_PAUSE_MOUSE,
+                            g_pauseMouse ? L"暂停鼠标键（开）" : L"暂停鼠标键（关）", 0 });
+    g_trayItems.push_back({ 0, L"", 0 });
+    g_trayItems.push_back({ ID_TRAY_EXIT, L"退出(D)", L'D' });
 
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW, L"显示窗口");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"设置");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_PAUSE_HOTKEY,
-                g_pauseHotkey ? L"暂停使用快捷键（开）" : L"暂停使用快捷键（关）");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_PAUSE_MOUSE,
-                g_pauseMouse ? L"暂停使用鼠标（开）" : L"暂停使用鼠标（关）");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出(&D)");
+    g_trayDpi = m_dpi > 0 ? m_dpi : 96;
+    TrayMeasure();
 
-    POINT pt = {0, 0};
+    static bool sClassReg = false;
+    if (!sClassReg) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = TrayMenuProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+        wc.lpszClassName = kTrayMenuClass;
+        if (!RegisterClassExW(&wc)) return;
+        sClassReg = true;
+    }
+
+    POINT pt = { 0, 0 };
     GetCursorPos(&pt);
-    // Required so the menu does not vanish immediately on show.
-    SetForegroundWindow(m_hwnd);
-    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-                   pt.x, pt.y, 0, m_hwnd, nullptr);
-    DestroyMenu(hMenu);
+    int x = pt.x;
+    int y = pt.y - g_trayH;    // 底边对齐光标（原来是 TPM_BOTTOMALIGN 的效果）
+    MONITORINFO moni;
+    ZeroMemory(&moni, sizeof(moni));
+    moni.cbSize = sizeof(moni);
+    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &moni)) {
+        if (x + g_trayW > moni.rcWork.right) x = moni.rcWork.right - g_trayW;
+        if (x < moni.rcWork.left) x = moni.rcWork.left;
+        if (y + g_trayH > moni.rcWork.bottom) y = moni.rcWork.bottom - g_trayH;
+        if (y < moni.rcWork.top) y = moni.rcWork.top;
+    }
+
+    SetForegroundWindow(m_hwnd);   // 托盘菜单的常规做法，保证弹窗能拿到输入
+    HWND w = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kTrayMenuClass, L"",
+                             WS_POPUP, x, y, g_trayW, g_trayH,
+                             m_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!w) return;
+    HRGN rgn = CreateRoundRectRgn(0, 0, g_trayW + 1, g_trayH + 1,
+                                  MulDiv(10, g_trayDpi, 96), MulDiv(10, g_trayDpi, 96));
+    if (rgn) SetWindowRgn(w, rgn, TRUE);   // region 交给系统，不能自己删
+
+    g_trayMain = m_hwnd;
+    g_trayWnd = w;
+    g_trayHot = -1;
+    g_trayDone = false;
+    g_trayChosen = 0;
+    g_trayOpenTick = GetTickCount();
+    ShowWindow(w, SW_SHOW);
+    SetForegroundWindow(w);   // 拿到焦点，D / Esc / 回车才有效
+    SetActiveWindow(w);       // 同一线程里还有主窗口，必须显式设为本线程的活动窗口
+    SetFocus(w);
+    SetCapture(w);            // 鼠标点到菜单外面也能收到，用来收起
+    g_trayKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, TrayLLKeyProc,
+                                      GetModuleHandleW(nullptr), 0);
 }
 
 // ---------------------------------------------------------------------------
