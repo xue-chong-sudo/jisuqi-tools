@@ -201,11 +201,11 @@ int main() {
             Check(tb != nullptr, "S1 工具栏出现");
             if (tb) {
                 RECT tr; GetWindowRect(tb, &tr);
-                // 单行图标工具栏定案尺寸 616x48（1.2 倍放大后；再之前是 512x40 / 512x72）。
-                printf("[drv4]      工具栏 %ldx%ld（期望 616x48）\n",
+                // 单行图标工具栏定案尺寸 626x48（1.2 倍放大后；再之前是 512x40 / 512x72）。
+                printf("[drv4]      工具栏 %ldx%ld（期望 626x48）\n",
                        tr.right - tr.left, tr.bottom - tr.top);
-                Check(tr.right - tr.left == 616 && tr.bottom - tr.top == 48,
-                      "S1 工具栏是单行 616x48");
+                Check(tr.right - tr.left == 626 && tr.bottom - tr.top == 48,
+                      "S1 工具栏是单行 626x48");
 
                 ClickTb(tb, TB_RECT);
                 Check(FindByClass(kMaskClass, g_pid) != nullptr,

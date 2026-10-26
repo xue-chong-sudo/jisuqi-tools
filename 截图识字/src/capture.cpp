@@ -950,7 +950,11 @@ static void PaintTextLayer(const RECT& band, const OverlayState& s) {
     if (REmpty(su.clip)) return;
 
     // ---- ① 把词框合并成行带 ----
-    struct LineBand { int x0, y0, x1, y1; bool sel; };
+    // 合并规则抄自旧结果窗的 CollectLineBands：垂直重叠超过较矮者一半就算同一行。
+    // 为什么必须合并：Tesseract 的词框是"紧贴墨迹"的，同一行里每个词的高矮、上下
+    // 都不一致，逐词上色就是用户说的「蓝色示意图大大小小，不统一」。合并成行带后
+    // 同一行只剩一条等高的带。
+    struct LineBand { int x0, y0, x1, y1; std::vector<int> members; };
     std::vector<LineBand> lines;
     {
         std::vector<int> order;
@@ -961,7 +965,6 @@ static void PaintTextLayer(const RECT& band, const OverlayState& s) {
                   [&s](int a, int b) { return s.words[a].y < s.words[b].y; });
         for (int i : order) {
             const OcrWord& w = s.words[i];
-            const bool sel = (i < (int)s.wordSel.size() && s.wordSel[i] != 0);
             bool merged = false;
             for (LineBand& b : lines) {
                 const int ovTop = std::max(b.y0, w.y);
@@ -972,24 +975,37 @@ static void PaintTextLayer(const RECT& band, const OverlayState& s) {
                     b.y0 = std::min(b.y0, w.y);
                     b.x1 = std::max(b.x1, w.x + w.w);
                     b.y1 = std::max(b.y1, w.y + w.h);
-                    b.sel = b.sel || sel;        // 带里任一词被选中 → 整条走选中色
+                    b.members.push_back(i);
                     merged = true;
                     break;
                 }
             }
-            if (!merged) lines.push_back({ w.x, w.y, w.x + w.w, w.y + w.h, sel });
+            if (!merged) {
+                LineBand nb{ w.x, w.y, w.x + w.w, w.y + w.h };
+                nb.members.push_back(i);
+                lines.push_back(nb);
+            }
         }
     }
 
     // ---- ② 逐条带刷像素：只换背景，文字原样保留 ----
+    // 底色一律用"未选中"色；被选中的词再按**它自己的 x 区间 + 行带的 y 区间**
+    // 叠"选中"色。两步必须在**同一个像素循环**里按列决定，不能涂两遍：
+    // 涂两遍时第二遍会拿"已被涂成浅蓝"的像素重新判亮度，暗色主题的判据
+    // （lum < 96）当场不成立——选中色永远上不去（这个 bug 是 txt_band_probe
+    // 的暗色用例抓出来的）。
+    // 也不能做成"带里任一词选中就整条变深色"：那样点一个词整行都变深，
+    // 用户反而看不出自己点的是哪个词（等高条带治的是"大大小小"，不是抹掉选中态）。
     for (const LineBand& b : lines) {
-        const RECT r = RIntersect(su.clip, RECT{ b.x0, b.y0, b.x1, b.y1 });
-        if (REmpty(r)) continue;
+        const RECT raw{ b.x0, b.y0, b.x1, b.y1 };
+        const RECT rc = RIntersect(su.clip, raw);
+        if (REmpty(rc)) continue;
+        // 亮度中位数定深浅：浅底深字 vs 深底浅字（暗色主题），两者的"背景"判据相反
         int hist[256] = { 0 };
         int total = 0;
-        for (int y = r.top; y < r.bottom; ++y) {
-            const BYTE* p = (const BYTE*)g.bits + ((size_t)y * g.vw + r.left) * 4;
-            for (int x = r.left; x < r.right; ++x, p += 4) {
+        for (int y = rc.top; y < rc.bottom; ++y) {
+            const BYTE* p = (const BYTE*)g.bits + ((size_t)y * g.vw + rc.left) * 4;
+            for (int x = rc.left; x < rc.right; ++x, p += 4) {
                 ++hist[(p[2] * 299 + p[1] * 587 + p[0] * 114) / 1000];
                 ++total;
             }
@@ -999,18 +1015,30 @@ static void PaintTextLayer(const RECT& band, const OverlayState& s) {
             acc += hist[v];
             if (acc * 2 >= total) { med = v; break; }
         }
-        const bool dark = (med < 128);           // 深底浅字（暗色主题）
-        const BYTE hr = b.sel ? 170 : 214;       // 选中 RGB(170,205,245) / 未选中 RGB(214,230,250)
-        const BYTE hg = b.sel ? 205 : 230;
-        const BYTE hb = b.sel ? 245 : 250;
-        for (int y = r.top; y < r.bottom; ++y) {
-            BYTE* p = (BYTE*)g.bits + ((size_t)y * g.vw + r.left) * 4;
-            for (int x = r.left; x < r.right; ++x, p += 4) {
+        const bool dark = (med < 128);
+        // 按列预置"这一列落在被选中的词里"：行带宽度通常几百像素，逐列算一次
+        // 比每个像素再遍历 members 便宜，也省掉"同一行里两个词重叠"的歧义。
+        const int bw = b.x1 - b.x0;
+        std::vector<unsigned char> colSel((size_t)bw, 0);
+        for (int i : b.members) {
+            if (i >= (int)s.wordSel.size() || !s.wordSel[i]) continue;
+            const OcrWord& w = s.words[i];
+            const int c0 = std::max(0, w.x - b.x0);
+            const int c1 = std::min(bw, w.x + w.w - b.x0);
+            for (int x = c0; x < c1; ++x) colSel[(size_t)x] = 1;
+        }
+        for (int y = rc.top; y < rc.bottom; ++y) {
+            BYTE* p = (BYTE*)g.bits + ((size_t)y * g.vw + rc.left) * 4;
+            for (int x = rc.left; x < rc.right; ++x, p += 4) {
                 const int lum = (p[2] * 299 + p[1] * 587 + p[0] * 114) / 1000;
                 const bool isBg = dark ? (lum < 96) : (lum >= 160);
                 if (!isBg) continue;             // 文字像素：一个字节都不动
-                p[0] = hb; p[1] = hg; p[2] = hr; // BGRA
-                p[3] = 255;
+                const bool sel = colSel[(size_t)(x - b.x0)] != 0;
+                // 选中 RGB(170,205,245) / 未选中 RGB(214,230,250)
+                p[0] = sel ? 245 : 250;          // B
+                p[1] = sel ? 205 : 230;          // G
+                p[2] = sel ? 170 : 214;          // R
+                p[3] = 255;                      // 遮罩层不变量
             }
         }
     }
@@ -1421,9 +1449,12 @@ static void Redraw() {
 //          10   52   94  136 178     230          282      487
 //
 // 按钮 38x38（pitch 42，间隔 4）；颜色/粗细圆 pitch 31，圆点直径 22。
-// 宽 616 = 512*1.2，高 48 = 40*1.2；最后一档粗细圆心 604 + 半径 12 = 616，正好贴右边。
+// 高 48 = 40*1.2。宽是**量出来的**，不是简单乘 1.2：
+//   最后一档粗细圆心 604 + 圆点半径 12 = 616，但选中时它背后还要垫一块 28x28 的
+//   浅蓝方块（590..618），正好被窗口圆角切掉一角。所以右边再留 10（与左边距对称）
+//   → 626。改宽度前先看这条注释，别又贴边。
 // 整条用 GDI+ 抗锯齿重绘（纯 GDI 的 Rectangle/Ellipse 是 1px 硬边，用户嫌"线条不圆滑"）。
-constexpr int kTbW = 616;      // 512 * 1.2
+constexpr int kTbW = 626;      // 604 + 12 + 10（右侧留白，给选中垫底方块让位）
 constexpr int kTbH = 48;       // 40  * 1.2
 constexpr int kTbPad   = 10;
 constexpr int kTbBtn   = 38;   // 按钮边长

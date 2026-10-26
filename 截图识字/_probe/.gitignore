@@ -4,3 +4,5 @@
 *_out.txt
 tmp/
 _commitmsg.txt
+_out_*.png
+_out_*.bmp
