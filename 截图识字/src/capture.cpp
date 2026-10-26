@@ -15,6 +15,8 @@
 #include <utility>   // std::move（OverlayState 里的标注 vector 每帧搬一次）
 #include <string>
 #include <gdiplus.h> // 工具栏抗锯齿（只画工具栏，绝不进 g.bits；wWinMain 已 GdiplusStartup）
+#include <shlobj.h>  // SHGetFolderPathW：没有"上次保存目录"时默认落桌面
+#include <cwctype>  // towlower：按扩展名判 png/jpg
 namespace gp = Gdiplus;   // 与 view.cpp 同名简写，两个 TU 各自独立
 
 // GET_X_LPARAM/GET_Y_LPARAM normally live in <windowsx.h>, but that header
@@ -81,7 +83,9 @@ struct Cap {
     std::vector<Anno> annos;   // 已完成的标注（绝对虚拟屏坐标）
     Anno  annCur;              // 正在画的那一条
     bool  drawingAnn = false;
-    int   annTool = AT_NONE;   // 当前选中的工具；AT_NONE = 不在标注模式
+    // 默认就是「文」（文字识别）：截完图一进调整态，拖一下就能框选识字（用户定案）。
+    // 再点一次「文」会退回 AT_NONE（TbCommand 里的同键切换），这是对的。
+    int   annTool = AT_TEXT;   // 当前选中的工具；AT_NONE = 不在标注模式
     int   annColor = 0;
     int   annWidthIdx = 0;
     // ---- 框选识别（「文」工具）----
@@ -1443,29 +1447,27 @@ static void Redraw() {
 //      和"多一条 band 吃掉 kBandCap 预算"两个坑。
 // 所以：独立 WS_POPUP + WS_EX_TOPMOST 压在遮罩之上；点击不抢焦点
 // （WM_MOUSEACTIVATE 返回 MA_NOACTIVATE），否则遮罩收不到 ESC。
-// 单行、「1.2 倍」放大后的纯图标工具栏（用户定案：不要文字按钮，整体放大 1.2 倍）：
+// 单行、纯图标工具栏。水平布局（定案）：
 //
-//   pad=10 ┌矩形 椭圆 箭头 画笔 文┐14┌ 保存(下载) ┐6│ 颜色×6 │ 粗细×4
-//          10   52   94  136 178     230          282      487
+//   pad=10 ┌矩形 椭圆 箭头 画笔 文┐ 4 ┌下载┐ 14 │ 颜色×6 │ 14 粗细×4
+//          10   52   94  136 178     220       272       477
 //
 // 按钮 38x38（pitch 42，间隔 4）；颜色/粗细圆 pitch 31，圆点直径 22。
-// 高 48 = 40*1.2。宽是**量出来的**，不是简单乘 1.2：
-//   最后一档粗细圆心 604 + 圆点半径 12 = 616，但选中时它背后还要垫一块 28x28 的
-//   浅蓝方块（590..618），正好被窗口圆角切掉一角。所以右边再留 10（与左边距对称）
-//   → 626。改宽度前先看这条注释，别又贴边。
-// 整条用 GDI+ 抗锯齿重绘（纯 GDI 的 Rectangle/Ellipse 是 1px 硬边，用户嫌"线条不圆滑"）。
-constexpr int kTbW = 626;      // 604 + 12 + 10（右侧留白，给选中垫底方块让位）
-constexpr int kTbH = 48;       // 40  * 1.2
-constexpr int kTbPad   = 10;
-constexpr int kTbBtn   = 38;   // 按钮边长
-constexpr int kTbStep  = 42;   // 按钮 pitch（间隔 4）
-constexpr int kTbSaveX = 230;  // 「文」右侧空 14
-constexpr int kTbSep1  = 282;  // 保存 与 颜色 之间的竖线
-constexpr int kTbSep2  = 487;  // 颜色 与 粗细 之间的竖线
-constexpr int kTbSwX0  = 307;  // 第 0 个颜色圆圆心 x
+// 「下载」两侧的间距必须和其他图标一致：文按钮右边 216、下载左边 220（间隔 4）。
+// 之前是 230（间隔 14），用户原话"下载的图标怎么和左右相离这么远"。
+// 宽度 620 = 最后一档粗细圆心 596 + 选中垫底方块半宽 14 = 610，右边再留 10（与左对称）。
+constexpr int kTbW    = 620;
+constexpr int kTbH    = 48;    // 40 * 1.2
+constexpr int kTbPad  = 10;
+constexpr int kTbBtn  = 38;    // 按钮边长
+constexpr int kTbStep = 42;    // 按钮 pitch（间隔 4）
+constexpr int kTbSaveX = 220;  // 216 + 4：和工具按钮间距一致
+constexpr int kTbSep1  = 272;  // 258 + 14
+constexpr int kTbSep2  = 477;
+constexpr int kTbSwX0  = 297;  // 圆心 297..452，最右 452+11=463
 constexpr int kTbSwStep = 31;
 constexpr int kTbSwR   = 11;   // 直径 22
-constexpr int kTbWdX0  = 511;  // 第 0 档粗细圆心 x
+constexpr int kTbWdX0  = 503;  // 圆心 503..596
 constexpr int kTbWdStep = 31;
 constexpr int kTbHit   = 26;   // 颜色/粗细点击区边长
 constexpr int kTbBtnY  = (kTbH - kTbBtn) / 2;   // 5：按钮垂直居中
@@ -1537,6 +1539,117 @@ static void FinishAdjust(int action) {
 // 工具栏命令分发：工具/颜色/粗细只改状态，只有 kTbSave 收尾。
 // 这里刻意**不调 Redraw()**：这些键只影响工具栏自身和"后续绘制用什么参数"，
 // 调 Redraw 会让整块选区重画一遍（白闪一帧），纯浪费。
+// ---- 「下载」：另存为 + 上次目录记忆 ----
+// 用户："下载之后下载到哪去了？怎么没有弹保存地址啊，我选择保存的地方啊。而且要有记忆，
+// 默认选择上一次保存的地方。" —— 之前点下载只把图塞进剪贴板，从来不弹框。
+// 目录记在 shot_ui.ini 的 [save] lastdir，和颜色/粗细同一份文件（不碰 settings.ini）。
+static std::wstring g_savePath;       // 用户确认后的目标路径
+static bool         g_saveToFile = false;  // 这次截图要写文件（尾部按它分流）
+
+static std::wstring LoadLastSaveDir() {
+    const std::wstring p = ShotUiIni();
+    if (p.empty()) return std::wstring();
+    wchar_t buf[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"save", L"lastdir", L"", buf, MAX_PATH, p.c_str());
+    if (!buf[0]) return std::wstring();
+    // 目录可能已经被用户删了：不存在的就别当默认目录，回落桌面
+    const DWORD at = GetFileAttributesW(buf);
+    if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) return std::wstring();
+    return std::wstring(buf);
+}
+
+static void StoreLastSaveDir(const std::wstring& dir) {
+    const std::wstring p = ShotUiIni();
+    if (p.empty() || dir.empty()) return;
+    WritePrivateProfileStringW(L"save", L"lastdir", dir.c_str(), p.c_str());
+}
+
+// 按 MIME 找 GDI+ 编码器（与 view.cpp 的 TbEncoderClsid 同一套写法，两个 TU 各一份）
+static int TbEncoderClsid(const wchar_t* mime, CLSID* clsid) {
+    UINT num = 0, bytes = 0;
+    if (gp::GetImageEncodersSize(&num, &bytes) != gp::Ok || bytes == 0) return -1;
+    std::vector<BYTE> buf(bytes);
+    auto* info = reinterpret_cast<gp::ImageCodecInfo*>(buf.data());
+    if (gp::GetImageEncoders(num, bytes, info) != gp::Ok) return -1;
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(info[i].MimeType, mime) == 0) { *clsid = info[i].Clsid; return (int)i; }
+    }
+    return -1;
+}
+
+// 把已经合成好标注的成品图（img.rgb：24bpp、RGB 顺序、行优先、**无行填充**）写盘。
+// 注意按行 memcpy：gp::BitmapData.Stride 可能带 4 字节对齐，整块拷会错行。
+static bool SaveImageToFile(const CaptureImage& img, const std::wstring& path) {
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0 || img.rgb.size() < (size_t)W * H * 3) return false;
+    std::wstring ext;
+    const size_t dot = path.find_last_of(L'.');
+    if (dot != std::wstring::npos) ext = path.substr(dot + 1);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    const bool jpg = (ext == L"jpg" || ext == L"jpeg");
+    CLSID clsid{};
+    if (TbEncoderClsid(jpg ? L"image/jpeg" : L"image/png", &clsid) < 0) {
+        MessageBoxW(g.w, L"系统缺少对应的图片编码器，无法保存。", L"下载", MB_ICONWARNING);
+        return false;
+    }
+    gp::Bitmap bmp(W, H, PixelFormat24bppRGB);   // 宏，不能加 gp::（C2589）
+    if (bmp.GetLastStatus() != gp::Ok) return false;
+    {
+        gp::Rect rc(0, 0, W, H);
+        gp::BitmapData bd{};
+        if (bmp.LockBits(&rc, gp::ImageLockModeWrite, PixelFormat24bppRGB, &bd) != gp::Ok)
+            return false;
+        for (int y = 0; y < H; ++y)
+            memcpy((BYTE*)bd.Scan0 + (size_t)y * bd.Stride,
+                   &img.rgb[(size_t)y * W * 3], (size_t)W * 3);
+        bmp.UnlockBits(&bd);
+    }
+    if (bmp.Save(path.c_str(), &clsid, nullptr) != gp::Ok) {
+        MessageBoxW(g.w, L"保存失败（路径只读、磁盘空间不足或被占用）。", L"下载", MB_ICONWARNING);
+        return false;
+    }
+    return true;
+}
+
+// 弹「另存为」。返回 false = 用户取消；调用方必须**原地停着**，不能当成取消截图。
+static bool AskSaveImagePath(std::wstring& out) {
+    std::wstring dir = LoadLastSaveDir();
+    if (dir.empty()) {
+        wchar_t desk[MAX_PATH] = {};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desk)) || !desk[0])
+            GetCurrentDirectoryW(MAX_PATH, desk);
+        dir = desk;
+    }
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t name[64] = {};
+    swprintf(name, 64, L"截图_%04d%02d%02d_%02d%02d%02d.png",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // 只把**文件名**放进 lpstrFile，目录交给 lpstrInitialDir：
+    // 两者都塞全路径时，Vista 之后的 IFileSaveDialog 会以 shell 自己的 MRU 为准
+    // （实测：ini 指向 A、上次存过桌面，对话框还是开在桌面）；拆开之后才对。
+    std::vector<wchar_t> buf(MAX_PATH, 0);
+    const size_t cp = wcslen(name) < (size_t)MAX_PATH - 1 ? wcslen(name) : (size_t)MAX_PATH - 1;
+    memcpy(buf.data(), name, cp * sizeof(wchar_t));
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g.w;      // 挂在遮罩上：模态对话框一定压在遮罩和工具栏之上
+    ofn.lpstrFilter = L"PNG 图片 (*.png)\0*.png\0JPEG 图片 (*.jpg)\0*.jpg\0所有文件 (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"png";
+    // **必须**显式给 lpstrInitialDir：只把目录拼进 lpstrFile 不够 —— Vista 之后的
+    // IFileSaveDialog 会用 shell 自己的"上次访问文件夹"MRU 覆盖初始目录。实测：
+    // ini 里 lastdir 指向 A 目录、上一次保存去过桌面，则对话框仍开在桌面。
+    ofn.lpstrInitialDir = dir.c_str();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    out = buf.data();
+    return !out.empty();
+}
+
 static void TbCommand(int id) {
     if (id >= kTbRect && id <= kTbText) {
         const int t = AT_RECT + (id - kTbRect);
@@ -1553,7 +1666,18 @@ static void TbCommand(int id) {
         SaveAnnoPrefs();
         return;
     }
-    FinishAdjust(id);                                // 6 = 保存（下载图标）
+    // 6 = 下载：先弹「另存为」，用户确认了才收尾；取消就停在调整态（遮罩、工具栏都还在）
+    if (id == kTbSave) {
+        std::wstring path;
+        if (!AskSaveImagePath(path)) return;
+        const size_t slash = path.find_last_of(L'\\');
+        if (slash != std::wstring::npos && slash > 0) StoreLastSaveDir(path.substr(0, slash));
+        g_savePath = path;
+        g_saveToFile = true;
+        FinishAdjust(kTbSave);
+        return;
+    }
+    FinishAdjust(id);                                // 其余（关闭等）按老路收尾
 }
 
 // 工具栏跟随选区：优先贴在选区正下方居中，下方放不下改上方，再钳回工作区。
@@ -1651,7 +1775,9 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             const float len = std::sqrt(dx * dx + dy * dy);
             const float ux = dx / len, uy = dy / len;    // 轴向单位向量
             const float px = -uy, py = ux;               // 垂直向单位向量
-            const float w = 3.3f, tip = 7.5f;
+            // w = 笔身半宽。用户："笔的图标上展示的那支笔的宽度稍微粗一点，大概 1.2 倍"：
+            // 3.3 * 1.2 ≈ 4.0。线宽（3.2f）不变，只把笔身加粗。
+            const float w = 4.0f, tip = 7.5f;
             const gp::PointF B1(T.X + ux * tip + px * w, T.Y + uy * tip + py * w);
             const gp::PointF B2(T.X + ux * tip - px * w, T.Y + uy * tip - py * w);
             const gp::PointF A2(E.X - px * w, E.Y - py * w);
@@ -1674,19 +1800,13 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             break;
         }
         case kTbText: {
-            // 「文」字：MeasureString 精确居中。/permissive 下不能对临时对象取地址，
-            // 且 FontFamily 必须先于 Font 构造、晚于 Font 析构 → 一并 static。
-            static gp::FontFamily ffText(L"Microsoft YaHei");
-            static gp::Font fText(&ffText, 26, gp::FontStyleRegular, gp::UnitPixel);
-            gp::SolidBrush tb(ink);
-            gp::StringFormat sf;
-            sf.SetAlignment(gp::StringAlignmentCenter);
-            sf.SetLineAlignment(gp::StringAlignmentCenter);
-            gp::RectF meas;
-            gr.MeasureString(L"文", 1, &fText, gp::PointF(0.f, 0.f), &sf, &meas);
-            const float fx = cx - meas.Width / 2 - meas.X;
-            const float fy = cy - meas.Height / 2 - meas.Y;
-            gr.DrawString(L"文", -1, &fText, gp::PointF(fx, fy), &sf, &tb);
+            // 「文」不再用字体画。用户："也太丑了、太大了，和周围都不统一，笔画的粗细都不一样" ——
+            // 26px 的中文字横细竖粗，和旁边 3.2f 等粗的线形图标根本不是一套语言。
+            // 现在用**同一支笔**（3.2f 圆头圆角）手画四笔：点、横、撇、捺，字面框 22x22。
+            gr.DrawLine(&pen, gp::PointF(cx + 0.5f, cy - 10.5f), gp::PointF(cx + 3.5f, cy - 8.0f));  // 点
+            gr.DrawLine(&pen, gp::PointF(cx - 10.5f, cy - 4.0f), gp::PointF(cx + 10.5f, cy - 4.0f)); // 横
+            gr.DrawLine(&pen, gp::PointF(cx + 1.5f, cy - 4.0f), gp::PointF(cx - 9.0f, cy + 10.5f));   // 撇
+            gr.DrawLine(&pen, gp::PointF(cx + 1.5f, cy - 4.0f), gp::PointF(cx + 9.5f, cy + 10.5f));   // 捺
             break;
         }
         case kTbSave: {
@@ -2138,6 +2258,10 @@ CaptureImage CaptureRegionInteractive() {
 
     g = Cap{};
     g_shotCopied = false;      // 新一轮：清空"已写剪贴板"标记
+    // 「下载」的目标路径是"这一次截图"的临时状态，必须每轮清掉：
+    // 否则上一轮存过的文件会一直挂着，下次点 ESC 保存也会跟着写一遍同一个路径。
+    g_saveToFile = false;
+    g_savePath.clear();
     g.vx = vx; g.vy = vy; g.vw = vw; g.vh = vh;
     // 颜色/粗细记忆：宿主是常驻进程，但用户在外部改 shot_ui.ini 也要生效，
     // 所以每次开新截图读一次（两次 GetPrivateProfileInt，代价可以忽略）。
@@ -2323,8 +2447,14 @@ CaptureImage CaptureRegionInteractive() {
     //
     // 「文」工具框出来的词优先：有子框且认出了词 → 先图后文（两次独立会话），
     // 这样 Ctrl+V 得到文字、Win+V 里图和字两条都在，与 ShotOcrAndCopy 的语义一致。
+    // 分流顺序：用户点了「下载」并选了路径 → 只写文件（图里已经合成好标注了，
+    // 就是用户看到的成品，不要再画一遍）。这条必须排在最前，否则会被"有选中词"
+    // 或"saveToClip"抢走。
     std::string picked = PickedTextUtf8();
-    if (!picked.empty()) {
+    if (g_saveToFile && !g_savePath.empty()) {
+        g_shotCopied = true;                 // 已经给了用户结果，不用再弹旧结果窗
+        SaveImageToFile(out, g_savePath);
+    } else if (!picked.empty()) {
         g_shotCopied = true;
         ShotCopyImageThenText(out, picked);
     } else if (g.ocrWanted) {         // 兜底：整块识别（工具栏上已无此按钮，留着不删）

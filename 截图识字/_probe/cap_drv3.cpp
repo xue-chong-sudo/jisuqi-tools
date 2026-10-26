@@ -72,9 +72,9 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 //   颜色 20..25 中心 x = 247+26i
 //   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 307 + 31 * (id - 20), 24 };
-    if (id >= 30 && id <= 33) return POINT{ 511 + 31 * (id - 30), 24 };
-    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 };
+    if (id >= 20 && id <= 25) return POINT{ 297 + 31 * (id - 20), 24 };
+    if (id >= 30 && id <= 33) return POINT{ 503 + 31 * (id - 30), 24 };
+    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 239, 0, 0 };
     return POINT{ cx[id], 24 };
 }
 
@@ -206,14 +206,17 @@ int main() {
     if (!tb) { DestroyWindow(tw); return 1; }
 
     // 现在没有「识别文字」按钮了：点「文」工具 → 在选区内拖一个子框 → 该子框立即跑 OCR
-    ClickTb(tb, 5);                 // 5 = 文（框选识别）
+    // 注意：**默认工具就是「文」**（capture.cpp 里 annTool 初值 = AT_TEXT），
+    // 而 TbCommand 是"同键切换"——这里再点一次「文」会把它关掉（实测剪贴板里就没文字了），
+    // 所以刻意不点。
     DragTo(mask, g_txtRect.left + 12, g_txtRect.top + 12,
                  g_txtRect.right - 12, g_txtRect.bottom - 12, 16);
     Pump(6000);                     // OCR 是同步的，这里只是等它把词画出来
     Check(FindByClass(kMaskClass, pid) != nullptr,
           "框选识别后遮罩仍在（识别不应该把截图结束掉）");
 
-    ClickTb(tb, 6);                 // 6 = 保存（下载图标）
+    // 「下载」现在弹「另存为」、只写文件；本驱动验的是剪贴板先图后文 → 走 ESC
+    PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
     Pump(3000);
 
     Check(FindByClass(kMaskClass, pid) == nullptr, "识别完遮罩已销毁");

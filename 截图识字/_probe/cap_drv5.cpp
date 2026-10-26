@@ -74,9 +74,9 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 
 static void ClickTb(HWND tb, int id) {
     int x = 0, y = 24;
-    if (id >= 20 && id <= 25)      x = 307 + 31 * (id - 20);
-    else if (id >= 30 && id <= 33) x = 511 + 31 * (id - 30);
-    else { static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 }; x = cx[id]; }
+    if (id >= 20 && id <= 25)      x = 297 + 31 * (id - 20);
+    else if (id >= 30 && id <= 33) x = 503 + 31 * (id - 30);
+    else { static const int cx[9] = { 0, 29, 71, 113, 155, 197, 239, 0, 0 }; x = cx[id]; }
     SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
     SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
     SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
@@ -194,7 +194,8 @@ int main(int argc, char** argv) {
         if (!tb) return 1;
         ClickTb(tb, TB_RECT);
         DragTo(mask, g_vx + 300, g_vy + 300, g_vx + 500, g_vy + 450, 16);
-        ClickTb(tb, TB_SAVE);
+        // 「下载」现在弹「另存为」、只写文件；本驱动要剪贴板里的成品图 → 走 ESC
+        PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
         Sleep(400);
 
         Dib d = ReadClipDib();
@@ -218,7 +219,8 @@ int main(int argc, char** argv) {
                 ClickTb(tb, 20 + 0);
                 ClickTb(tb, TB_RECT);
                 DragTo(mask, g_vx + 300, g_vy + 300, g_vx + 500, g_vy + 450, 16);
-                ClickTb(tb, TB_SAVE);
+                // 「下载」现在弹「另存为」、只写文件；本驱动要剪贴板里的成品图 → 走 ESC
+        PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
                 Sleep(400);
                 Dib d = ReadClipDib();
                 if (d.ok) {

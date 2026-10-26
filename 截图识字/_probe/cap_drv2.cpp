@@ -69,9 +69,9 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 //   颜色 20..25 中心 x = 247+26i
 //   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 307 + 31 * (id - 20), 24 };
-    if (id >= 30 && id <= 33) return POINT{ 511 + 31 * (id - 30), 24 };
-    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 };
+    if (id >= 20 && id <= 25) return POINT{ 297 + 31 * (id - 20), 24 };
+    if (id >= 30 && id <= 33) return POINT{ 503 + 31 * (id - 30), 24 };
+    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 239, 0, 0 };
     return POINT{ cx[id], 24 };
 }
 
@@ -158,7 +158,7 @@ int main() {
         }
     }
 
-    // ---- S3：把手拖越对面 → 边界交换；再点"保存" ----
+    // ---- S3：把手拖越对面 → 边界交换；再 ESC 保存到剪贴板 ----
     {
         HWND mask = Trigger(host, trig);
         Check(mask != nullptr, "S3 遮罩出现");
@@ -171,9 +171,10 @@ int main() {
                 int my = (t + b) / 2;                // 左中把手中心 = (sel.left, 中线)
                 DragTo(mask, l, my, g_vx + 900, my, 12);   // 400 -> 900，越过右边界 800
                 Sleep(150);
-                ClickTb(tb, 6);                      // 6 = 保存（下载图标）
+                // 「下载」现在弹「另存为」、只写文件；本驱动要剪贴板里的成品图 → 走 ESC
+                PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
                 Sleep(300);
-                Check(FindByClass(kMaskClass, g_pid) == nullptr, "S3 保存后遮罩销毁");
+                Check(FindByClass(kMaskClass, g_pid) == nullptr, "S3 保存后（ESC）遮罩销毁");
                 int cw = 0, ch = 0;
                 bool has = ReadClipboardDib(cw, ch);
                 Check(has, "S3 剪贴板有 CF_DIB");

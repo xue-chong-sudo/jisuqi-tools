@@ -15,4 +15,4 @@ EXTRA="${3:-}"
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$MSVC/bin/Hostx64/x64/cl.exe" \
   /nologo /O2 /EHsc /utf-8 /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS $EXTRA \
   "$TARGET" /Fe:"$OUT" \
-  /link user32.lib gdi32.lib dwmapi.lib gdiplus.lib /SUBSYSTEM:CONSOLE /MACHINE:X64
+  /link user32.lib gdi32.lib dwmapi.lib gdiplus.lib comdlg32.lib shell32.lib /SUBSYSTEM:CONSOLE /MACHINE:X64

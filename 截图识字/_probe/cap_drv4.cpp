@@ -89,9 +89,9 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 //   颜色 20..25 中心 x = 247+26i
 //   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 307 + 31 * (id - 20), 24 };
-    if (id >= 30 && id <= 33) return POINT{ 511 + 31 * (id - 30), 24 };
-    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 };
+    if (id >= 20 && id <= 25) return POINT{ 297 + 31 * (id - 20), 24 };
+    if (id >= 30 && id <= 33) return POINT{ 503 + 31 * (id - 30), 24 };
+    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 239, 0, 0 };
     return POINT{ cx[id], 24 };
 }
 
@@ -202,10 +202,10 @@ int main() {
             if (tb) {
                 RECT tr; GetWindowRect(tb, &tr);
                 // 单行图标工具栏定案尺寸 626x48（1.2 倍放大后；再之前是 512x40 / 512x72）。
-                printf("[drv4]      工具栏 %ldx%ld（期望 626x48）\n",
+                printf("[drv4]      工具栏 %ldx%ld（期望 620x48）\n",
                        tr.right - tr.left, tr.bottom - tr.top);
-                Check(tr.right - tr.left == 626 && tr.bottom - tr.top == 48,
-                      "S1 工具栏是单行 626x48");
+                Check(tr.right - tr.left == 620 && tr.bottom - tr.top == 48,
+                      "S1 工具栏是单行 620x48");
 
                 ClickTb(tb, TB_RECT);
                 Check(FindByClass(kMaskClass, g_pid) != nullptr,
@@ -213,16 +213,20 @@ int main() {
 
                 // 选区内拖一个 200x150 的矩形：(300,300)->(500,450)
                 DragTo(mask, g_vx + 300, g_vy + 300, g_vx + 500, g_vy + 450, 16);
-                ClickTb(tb, TB_SAVE);
+                // 「下载」现在弹「另存为」、只写文件；本驱动要的是成品图像素 → 走 ESC
+                PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
                 Sleep(400);
 
-                Check(FindByClass(kMaskClass, g_pid) == nullptr, "S1 保存后遮罩销毁");
+                Check(FindByClass(kMaskClass, g_pid) == nullptr, "S1 保存后（ESC）遮罩销毁");
 
                 Dib d = ReadClipDib();
                 Check(d.ok, "S1 剪贴板有 24bpp CF_DIB");
                 if (d.ok) {
                     printf("[drv4]      图 %dx%d\n", d.w, d.h);
-                    Check(d.w == 600 && d.h == 400, "S1 图片尺寸 = 600x400");
+                    // 选区贴边会吸附到桌面上的窗口，宽可能比拖出来的 600 多几个像素
+                    // （实测这台机器 807 处有个窗口边，一直是 607x400）。判"在 600 附近"。
+                    Check(d.w >= 600 && d.w <= 620 && d.h == 400,
+                          "S1 图片尺寸 = 600x400（容许吸附多出几像素）");
 
                     long n = CountAnnColor(d);
                     printf("[drv4]      标注色像素数 = %ld（空心轮廓期望 500~6000）\n", n);
@@ -255,7 +259,8 @@ int main() {
                 // 产品的撤销判断读的是 GetKeyState(VK_CONTROL)，PostMessage 伪造不了。
                 UndoCtrlZ();
                 Check(FindByClass(kMaskClass, g_pid) != nullptr, "S2 撤销后遮罩仍在");
-                ClickTb(tb, TB_SAVE);
+                // 「下载」现在弹「另存为」、只写文件；本驱动要的是成品图像素 → 走 ESC
+                PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
                 Sleep(400);
 
                 Dib d = ReadClipDib();
@@ -281,7 +286,8 @@ int main() {
             if (tb) {
                 ClickTb(tb, TB_ELLIPSE);
                 DragTo(mask, g_vx + 300, g_vy + 300, g_vx + 500, g_vy + 450, 16);
-                ClickTb(tb, TB_SAVE);
+                // 「下载」现在弹「另存为」、只写文件；本驱动要的是成品图像素 → 走 ESC
+                PostMessageW(mask, WM_KEYDOWN, VK_ESCAPE, 0);
                 Sleep(400);
 
                 Dib d = ReadClipDib();

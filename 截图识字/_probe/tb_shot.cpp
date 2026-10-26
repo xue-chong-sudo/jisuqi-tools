@@ -155,7 +155,7 @@ int main() {
     Capture(0);                       // ① 静息：此时已有默认工具，只作基线
     Click(tb, 29, 24);                // ② 点「矩形」
     Capture(1);
-    Click(tb, 604, 24);               // ③ 点最粗那档（验证右边不再顶边）
+    Click(tb, 596, 24);               // ③ 点最粗那档（圆心 503+31*3=596）
     Capture(2);
 
     if (SaveBmp3("_out_tb2.bmp", rows, 8)) printf("[shot] 已存 _out_tb2.bmp\n");
