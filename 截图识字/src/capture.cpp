@@ -14,6 +14,8 @@
 #include <cmath>     // cos / sin / atan2 / lround（自写光栅化用）
 #include <utility>   // std::move（OverlayState 里的标注 vector 每帧搬一次）
 #include <string>
+#include <mutex>     // 后台识别结果交给 UI 线程时的交接锁
+#include <atomic>    // 识别"代号"：只认最新一代的结果
 #include <gdiplus.h> // 工具栏抗锯齿（只画工具栏，绝不进 g.bits；wWinMain 已 GdiplusStartup）
 #include <shlobj.h>  // SHGetFolderPathW：没有"上次保存目录"时默认落桌面
 #include <cwctype>  // towlower：按扩展名判 png/jpg
@@ -1086,7 +1088,24 @@ static bool CropScreenRect(const RECT& a, CaptureImage& out, POINT& origin) {
     return true;
 }
 
-// 对 g.textRect 同步跑一次识别。词框转成绝对坐标（锚定图像内容，不跟选区跑）。
+// 后台识别完成的通知（发给遮罩窗口，在 UI 线程里回填词表）。
+static const UINT kMsgOcrDone = WM_APP + 1;
+static std::mutex        g_ocrMu;              // 保护 g_ocrStage / g.w 的交接
+static std::atomic<int>   g_ocrGen{ 0 };       // 识别"代号"：只有最新一代的结果才作数
+static std::vector<OcrWord> g_ocrStage;        // 后台线程写、UI 线程取
+
+// 对 g.textRect 跑一次识别。词框转成绝对坐标（锚定图像内容，不跟选区跑）。
+//
+// **异步**：识别本身 0.33~0.44 秒（实测：300x150 330ms / 700x400 435ms，
+// 且几乎不随面积变化，主要花在引擎每次调用的固定开销上），同步跑会把遮罩
+// 冻住半秒、鼠标变等待圈，那半秒里挪选区/换颜色全都没反应。
+// 所以这里只做"裁像素"（几毫秒，必须在 UI 线程读 g.screen），识别丢给后台，
+// 结果回来再补画高亮。用户松手就能继续操作。
+//
+// 为什么不做"从第一个点开始逐点增量识别"：实测每次调用都是 330ms 起，
+// 拖动中每帧调一次等于把 CPU 打满，框会卡死——越优化越慢。
+// 也不做"截完图就预识别整个选区"：整选区 435ms 反而比直接识别子框 330ms 更慢，
+// 且子框的词要从整图筛，边缘会被切断，准确率下降。
 static void RunTextOcr() {
     if (REmpty(g.textRect)) return;
     const int w = g.textRect.right - g.textRect.left;
@@ -1097,21 +1116,26 @@ static void RunTextOcr() {
     POINT org{ 0, 0 };
     if (!CropScreenRect(g.textRect, img, org)) return;
 
-    // 同步识别。必须**先** OcrEnsureEngine()：OcrImage() 只"用"引擎不"建"引擎，
-    // 而这条路径可能压根没预热（直接截图模式不预热），直接调会拿到空结果。
     g.ocrBusy = true;
-    SetCursor(LoadCursor(NULL, IDC_WAIT));
-    OcrEnsureEngine();
-    std::vector<OcrWord> ws = OcrImage(img);
-    SetCursor(LoadCursor(NULL, IDC_CROSS));
-    g.ocrBusy = false;
-
-    for (size_t i = 0; i < ws.size(); ++i) {
-        ws[i].x += org.x;
-        ws[i].y += org.y;
-    }
-    g.words = std::move(ws);
-    g.wordSel.assign(g.words.size(), 0);
+    const int myGen = ++g_ocrGen;        // 新一代：在途的旧结果回来会被丢弃
+    OcrImageAsync(img, [myGen, org](std::vector<OcrWord> ws) {
+        for (size_t i = 0; i < ws.size(); ++i) {
+            ws[i].x += org.x;
+            ws[i].y += org.y;
+        }
+        HWND target = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_ocrMu);
+            if (myGen != g_ocrGen.load()) return;   // 旧一代结果，丢弃
+            g_ocrStage = std::move(ws);
+            // 句柄在锁内取：窗口销毁路径摘句柄也在同一把锁内，所以这里拿到的
+            // 要么是尚未销毁的窗口，要么是 nullptr。
+            target = g.w;
+        }
+        // PostMessage 放在锁外：将来一旦有人把它改成 SendMessage，持锁等 UI
+        // 线程回调就是死锁。
+        if (target) PostMessageW(target, kMsgOcrDone, 0, 0);
+    });
 }
 
 // 保存时要写进剪贴板的文字：选中了就只取选中的，没选就取全部（按阅读顺序）。
@@ -1533,7 +1557,14 @@ static void FinishAdjust(int action) {
     g.saveToClip = (action == kTbSave);
     g.ocrWanted  = (action == kTbOcr);
     g.done = true;
-    if (g.w) DestroyWindow(g.w);
+    // 摘句柄与后台回调取句柄共用一把锁：置空之后回调不会再往野句柄投消息。
+    HWND mask = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_ocrMu);
+        mask = g.w;
+        g.w = nullptr;
+    }
+    if (mask) DestroyWindow(mask);
 }
 
 // 工具栏命令分发：工具/颜色/粗细只改状态，只有 kTbSave 收尾。
@@ -1980,6 +2011,24 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+        case kMsgOcrDone: {
+            // 后台识别回来了：在 UI 线程回填词表并重画。
+            // 代号不符说明这期间用户又框了一次（或新拉了一个子框），旧结果作废。
+            std::vector<OcrWord> ws;
+            {
+                std::lock_guard<std::mutex> lk(g_ocrMu);
+                ws.swap(g_ocrStage);
+            }
+            g.ocrBusy = false;
+            if (!ws.empty() || !g.words.empty()) {
+                g.words = std::move(ws);
+                g.wordSel.assign(g.words.size(), 0);
+                Redraw();
+            } else {
+                Redraw();        // 一个词都没认出来：也要重画一次，把"识别中"的痕迹清掉
+            }
+            return 0;
+        }
         case WM_LBUTTONDOWN: {
             POINT p;
             p.x = GET_X_LPARAM(l) + g.vx;
@@ -1990,7 +2039,8 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 // 其余位置什么都不做（避免误触把刚调好的选区清掉）
                 int i = HitHandle(p);
                 if (i >= 0) { g.dragHandle = i; SetCapture(h); Redraw(); break; }
-                if (g.ocrBusy) break;                    // 同步识别中：不接受新起笔
+                // 识别已改异步：这里**不再**挡"识别中再起笔"。旧结果回来时靠
+                // g_ocrGen 判代作废，用户想连着框第二次不用等上一次跑完。
                 if (g.annTool == AT_NONE || !PtInRect(&g.sel, p)) break;
                 if (g.annTool == AT_TEXT) {
                     // 子框**里面**按下 = 拖选词（不重新识别）；子框**外面**按下 = 拉新子框
@@ -2006,6 +2056,10 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                         g.textHasFocus = false;
                         g.words.clear();
                         g.wordSel.clear();
+                        // 作废旧识别：上一次框的结果可能还在后台跑，回来时不该
+                        // 盖到这次新拖的子框上。
+                        ++g_ocrGen;
+                        g.ocrBusy = false;
                     }
                     SetCapture(h);
                     Redraw();
@@ -2262,6 +2316,13 @@ CaptureImage CaptureRegionInteractive() {
     // 否则上一轮存过的文件会一直挂着，下次点 ESC 保存也会跟着写一遍同一个路径。
     g_saveToFile = false;
     g_savePath.clear();
+    // 上一轮可能还有识别在跑（用户在识别完成前就保存/取消了）。作废它，
+    // 并清掉暂存区，免得旧词表漏到这一轮的画面上。
+    {
+        std::lock_guard<std::mutex> lk(g_ocrMu);
+        g_ocrStage.clear();
+        ++g_ocrGen;
+    }
     g.vx = vx; g.vy = vy; g.vw = vw; g.vh = vh;
     // 颜色/粗细记忆：宿主是常驻进程，但用户在外部改 shot_ui.ini 也要生效，
     // 所以每次开新截图读一次（两次 GetPrivateProfileInt，代价可以忽略）。
