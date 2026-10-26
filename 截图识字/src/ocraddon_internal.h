@@ -79,6 +79,11 @@ bool ShotAlreadyCopied();
 // 正好与需求相反，所以这里刻意开两次会话。
 bool ShotOcrAndCopy(const CaptureImage& img);
 
+// 「文」工具框选识别的落盘：把已经识别好的文字（UTF-8）与图片按同一次
+// "先图后文、两次独立会话"的顺序写进剪贴板。语义与 ShotOcrAndCopy 完全一致，
+// 区别只是文字不用再识别一遍（词已经认过、用户还可能只选了其中几个）。
+bool ShotCopyImageThenText(const CaptureImage& img, const std::string& utf8);
+
 // 极速启 data\settings.ini 的绝对路径（main.cpp 提供）。用于把“上次保存目录”
 // 这类小状态放在同一个 data 目录里，不额外污染其它位置。取不到时返回空串。
 const wchar_t* ShotIniPath();

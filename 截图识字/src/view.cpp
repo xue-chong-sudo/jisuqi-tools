@@ -1668,6 +1668,16 @@ bool ShotOcrAndCopy(const CaptureImage& img) {
     return CopyTextToClipboard(nullptr, text);
 }
 
+// 「文」工具框选识别：词已经在遮罩层认过了（用户可能只选了其中几个），这里只负责
+// 按"先图后文 + 两次独立会话"落盘。顺序与理由见上面的 ShotOcrAndCopy，一模一样：
+// 一次会话写两个格式只会产生一条 Win+V 历史，且 Ctrl+V 拿到什么由目标应用决定。
+bool ShotCopyImageThenText(const CaptureImage& img, const std::string& utf8) {
+    if (img.width <= 0 || img.height <= 0) return false;
+    CopyImageToClipboard(img);                    // ① 图
+    if (utf8.empty()) return true;
+    return CopyTextToClipboard(nullptr, utf8);    // ② 文字（独立会话，压在上面）
+}
+
 // 复制选中的文字到剪贴板，并按“退出方式”处理后续：
 //   exit=0 复制后约 1 秒自动关闭；exit=1 复制后保持打开，等待 ESC 关闭。
 // 同时供右键菜单与 Ctrl+C 调用，避免逻辑重复。
