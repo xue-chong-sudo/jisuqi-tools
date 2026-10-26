@@ -89,10 +89,10 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 //   颜色 20..25 中心 x = 247+26i
 //   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 247 + 26 * (id - 20), 20 };
-    if (id >= 30 && id <= 33) return POINT{ 416 + 26 * (id - 30), 20 };
-    static const int cx[9] = { 0, 24, 58, 92, 126, 160, 204, 0, 0 };
-    return POINT{ cx[id], 20 };
+    if (id >= 20 && id <= 25) return POINT{ 307 + 31 * (id - 20), 24 };
+    if (id >= 30 && id <= 33) return POINT{ 511 + 31 * (id - 30), 24 };
+    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 };
+    return POINT{ cx[id], 24 };
 }
 
 // 真按键：Ctrl+Z。GetKeyState 读的是线程输入状态，只能靠 keybd_event 影响。
@@ -201,11 +201,11 @@ int main() {
             Check(tb != nullptr, "S1 工具栏出现");
             if (tb) {
                 RECT tr; GetWindowRect(tb, &tr);
-                // 单行图标工具栏定案尺寸 512x40（两行布局时代是 512x72）。
-                printf("[drv4]      工具栏 %ldx%ld（期望 512x40）\n",
+                // 单行图标工具栏定案尺寸 616x48（1.2 倍放大后；再之前是 512x40 / 512x72）。
+                printf("[drv4]      工具栏 %ldx%ld（期望 616x48）\n",
                        tr.right - tr.left, tr.bottom - tr.top);
-                Check(tr.right - tr.left == 512 && tr.bottom - tr.top == 40,
-                      "S1 工具栏是单行 512x40");
+                Check(tr.right - tr.left == 616 && tr.bottom - tr.top == 48,
+                      "S1 工具栏是单行 616x48");
 
                 ClickTb(tb, TB_RECT);
                 Check(FindByClass(kMaskClass, g_pid) != nullptr,

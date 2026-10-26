@@ -73,10 +73,10 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 }
 
 static void ClickTb(HWND tb, int id) {
-    int x = 0, y = 20;
-    if (id >= 20 && id <= 25)      x = 247 + 26 * (id - 20);
-    else if (id >= 30 && id <= 33) x = 416 + 26 * (id - 30);
-    else { static const int cx[9] = { 0, 24, 58, 92, 126, 160, 204, 0, 0 }; x = cx[id]; }
+    int x = 0, y = 24;
+    if (id >= 20 && id <= 25)      x = 307 + 31 * (id - 20);
+    else if (id >= 30 && id <= 33) x = 511 + 31 * (id - 30);
+    else { static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 }; x = cx[id]; }
     SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
     SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
     SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(x, y));

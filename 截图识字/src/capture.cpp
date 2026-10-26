@@ -14,6 +14,8 @@
 #include <cmath>     // cos / sin / atan2 / lround（自写光栅化用）
 #include <utility>   // std::move（OverlayState 里的标注 vector 每帧搬一次）
 #include <string>
+#include <gdiplus.h> // 工具栏抗锯齿（只画工具栏，绝不进 g.bits；wWinMain 已 GdiplusStartup）
+namespace gp = Gdiplus;   // 与 view.cpp 同名简写，两个 TU 各自独立
 
 // GET_X_LPARAM/GET_Y_LPARAM normally live in <windowsx.h>, but that header
 // tends to clash with other definitions. Define them locally to stay safe.
@@ -927,12 +929,14 @@ static void PaintAnnos(const RECT& band, const OverlayState& s) {
 
 // ---- 框选识别：绘制 ----
 // 两层：
-//   ① 词块高亮：**必须与底层像素混合**再写回，alpha 恒 255。g.bits 里没有合法的
-//      半透明（AC_SRC_ALPHA 下 alpha=128 就是真的半透明，会透出桌面），所以只能
-//      自己算混合。此刻 g.bits 已经是 "RestoreFromDim + PaintHole" 之后的干净桌面
-//      像素，直接读它混就对 —— 不需要再从 g.screen 取。
+//   ① 行带高亮：Tesseract 的词框高矮胖瘦各异、词间还有缝，逐词上色看着"大大小小
+//      不统一"（用户原话）。所以先把词按行合并成**等高条带**（垂直重叠 > 较小高度
+//      的一半即同行，取并集），再整条按像素刷。
+//      而且不整块叠色，只替换"背景类"像素、文字像素一个字节都不动 —— 否则字会被
+//      染蓝、笔画变糊。判定用条带内亮度中位数决定是"浅底深字"还是"深底浅字"。
 //   ② 子框虚线：1px 蓝，按 (x+y)%8<4 逐像素写。GDI 的 PS_DOT 依赖位图刷子与 DPI，
 //      跨缩放不稳；自己算的虚线在哪个 DPI 下都一模一样。
+// 写完的像素 alpha 一律 255（g.bits 的不变量，半透明会透出桌面）。
 static void PaintTextLayer(const RECT& band, const OverlayState& s) {
     if (!s.textHasFocus && s.words.empty()) return;
     Surf su;
@@ -945,20 +949,67 @@ static void PaintTextLayer(const RECT& band, const OverlayState& s) {
     su.clip = RIntersect(band, s.hole); // 洞外不画：词框跨洞边界时不该漏到压暗区
     if (REmpty(su.clip)) return;
 
-    for (size_t i = 0; i < s.words.size(); ++i) {
-        const OcrWord& w = s.words[i];
-        if (w.w <= 0 || w.h <= 0) continue;
-        const bool sel = (i < s.wordSel.size() && s.wordSel[i] != 0);
-        const int pct = sel ? 55 : 30;   // 选中更浓
-        const int keep = 100 - pct;
-        RECT r = RIntersect(su.clip, RECT{ w.x, w.y, w.x + w.w, w.y + w.h });
+    // ---- ① 把词框合并成行带 ----
+    struct LineBand { int x0, y0, x1, y1; bool sel; };
+    std::vector<LineBand> lines;
+    {
+        std::vector<int> order;
+        for (int i = 0; i < (int)s.words.size(); ++i) {
+            if (s.words[i].w > 0 && s.words[i].h > 0) order.push_back(i);
+        }
+        std::sort(order.begin(), order.end(),
+                  [&s](int a, int b) { return s.words[a].y < s.words[b].y; });
+        for (int i : order) {
+            const OcrWord& w = s.words[i];
+            const bool sel = (i < (int)s.wordSel.size() && s.wordSel[i] != 0);
+            bool merged = false;
+            for (LineBand& b : lines) {
+                const int ovTop = std::max(b.y0, w.y);
+                const int ovBot = std::min(b.y1, w.y + w.h);
+                const int minH  = std::min(b.y1 - b.y0, w.h);
+                if (ovBot - ovTop > minH / 2) {   // 同一行：并入并集
+                    b.x0 = std::min(b.x0, w.x);
+                    b.y0 = std::min(b.y0, w.y);
+                    b.x1 = std::max(b.x1, w.x + w.w);
+                    b.y1 = std::max(b.y1, w.y + w.h);
+                    b.sel = b.sel || sel;        // 带里任一词被选中 → 整条走选中色
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) lines.push_back({ w.x, w.y, w.x + w.w, w.y + w.h, sel });
+        }
+    }
+
+    // ---- ② 逐条带刷像素：只换背景，文字原样保留 ----
+    for (const LineBand& b : lines) {
+        const RECT r = RIntersect(su.clip, RECT{ b.x0, b.y0, b.x1, b.y1 });
+        if (REmpty(r)) continue;
+        int hist[256] = { 0 };
+        int total = 0;
+        for (int y = r.top; y < r.bottom; ++y) {
+            const BYTE* p = (const BYTE*)g.bits + ((size_t)y * g.vw + r.left) * 4;
+            for (int x = r.left; x < r.right; ++x, p += 4) {
+                ++hist[(p[2] * 299 + p[1] * 587 + p[0] * 114) / 1000];
+                ++total;
+            }
+        }
+        int med = 0, acc = 0;
+        for (int v = 0; v < 256; ++v) {
+            acc += hist[v];
+            if (acc * 2 >= total) { med = v; break; }
+        }
+        const bool dark = (med < 128);           // 深底浅字（暗色主题）
+        const BYTE hr = b.sel ? 170 : 214;       // 选中 RGB(170,205,245) / 未选中 RGB(214,230,250)
+        const BYTE hg = b.sel ? 205 : 230;
+        const BYTE hb = b.sel ? 245 : 250;
         for (int y = r.top; y < r.bottom; ++y) {
             BYTE* p = (BYTE*)g.bits + ((size_t)y * g.vw + r.left) * 4;
             for (int x = r.left; x < r.right; ++x, p += 4) {
-                // 高亮色 RGB(0,120,215)：B=215 G=120 R=0
-                p[0] = (BYTE)((p[0] * keep + 215 * pct) / 100);
-                p[1] = (BYTE)((p[1] * keep + 120 * pct) / 100);
-                p[2] = (BYTE)((p[2] * keep + 0 * pct) / 100);
+                const int lum = (p[2] * 299 + p[1] * 587 + p[0] * 114) / 1000;
+                const bool isBg = dark ? (lum < 96) : (lum >= 160);
+                if (!isBg) continue;             // 文字像素：一个字节都不动
+                p[0] = hb; p[1] = hg; p[2] = hr; // BGRA
                 p[3] = 255;
             }
         }
@@ -1364,27 +1415,30 @@ static void Redraw() {
 //      和"多一条 band 吃掉 kBandCap 预算"两个坑。
 // 所以：独立 WS_POPUP + WS_EX_TOPMOST 压在遮罩之上；点击不抢焦点
 // （WM_MOUSEACTIVATE 返回 MA_NOACTIVATE），否则遮罩收不到 ESC。
-// 单行 40 高、纯图标（用户定案：和以前一样，不要文字按钮）：
+// 单行、「1.2 倍」放大后的纯图标工具栏（用户定案：不要文字按钮，整体放大 1.2 倍）：
 //
-//   pad=8 ┌ 矩形 椭圆 箭头 画笔 文 ┐ 12 ┌ 保存(下载图标) ┐ 6 │ 8 颜色×6 │ 8 粗细×4
-//         8   42   76  110  144        188                226         396
+//   pad=10 ┌矩形 椭圆 箭头 画笔 文┐14┌ 保存(下载) ┐6│ 颜色×6 │ 粗细×4
+//          10   52   94  136 178     230          282      487
 //
-// 按钮 32x32、间距 2（pitch 34）；颜色圆直径 18、pitch 26；粗细圆 pitch 26。
-// 宽 = 512 是量出来的：最后一档粗细圆心 494 + 半径 10 的点击区 = 504，右边留 8。
-constexpr int kTbW = 512;
-constexpr int kTbH = 40;
-constexpr int kTbPad   = 8;
-constexpr int kTbBtn   = 32;      // 工具/保存按钮边长
-constexpr int kTbStep  = 34;      // 工具按钮 pitch（32 + 2）
-constexpr int kTbSaveX = 188;     // 保存按钮左边（与"文"之间空 12）
-constexpr int kTbSep1  = 226;     // 工具|保存 与 颜色 之间的竖线
-constexpr int kTbSep2  = 396;     // 颜色 与 粗细 之间的竖线
-constexpr int kTbSwX0  = 247;     // 第 0 个颜色圆的圆心 x
-constexpr int kTbSwStep = 26;     // 颜色圆 pitch
-constexpr int kTbSwR   = 9;       // 颜色圆半径（直径 18）
-constexpr int kTbWdX0  = 416;     // 第 0 档粗细的圆心 x
-constexpr int kTbWdStep = 26;
-constexpr int kTbHit   = 20;      // 颜色/粗细的点击区边长
+// 按钮 38x38（pitch 42，间隔 4）；颜色/粗细圆 pitch 31，圆点直径 22。
+// 宽 616 = 512*1.2，高 48 = 40*1.2；最后一档粗细圆心 604 + 半径 12 = 616，正好贴右边。
+// 整条用 GDI+ 抗锯齿重绘（纯 GDI 的 Rectangle/Ellipse 是 1px 硬边，用户嫌"线条不圆滑"）。
+constexpr int kTbW = 616;      // 512 * 1.2
+constexpr int kTbH = 48;       // 40  * 1.2
+constexpr int kTbPad   = 10;
+constexpr int kTbBtn   = 38;   // 按钮边长
+constexpr int kTbStep  = 42;   // 按钮 pitch（间隔 4）
+constexpr int kTbSaveX = 230;  // 「文」右侧空 14
+constexpr int kTbSep1  = 282;  // 保存 与 颜色 之间的竖线
+constexpr int kTbSep2  = 487;  // 颜色 与 粗细 之间的竖线
+constexpr int kTbSwX0  = 307;  // 第 0 个颜色圆圆心 x
+constexpr int kTbSwStep = 31;
+constexpr int kTbSwR   = 11;   // 直径 22
+constexpr int kTbWdX0  = 511;  // 第 0 档粗细圆心 x
+constexpr int kTbWdStep = 31;
+constexpr int kTbHit   = 26;   // 颜色/粗细点击区边长
+constexpr int kTbBtnY  = (kTbH - kTbBtn) / 2;   // 5：按钮垂直居中
+constexpr int kTbMidY  = kTbH / 2;              // 24：颜色/粗细圆心 y
 // id：1..5 工具（矩形/椭圆/箭头/画笔/文）、6 保存。
 // 7/8 是"识别文字/关闭"的历史编号，现在工具栏上没有按钮了（右键=取消，
 // 识别由「文」工具包办），但**保留枚举**：截图尾部的分流逻辑与 ocraddon.cpp
@@ -1398,34 +1452,23 @@ enum {
     kTbWidth0 = 30, kTbWidth3 = 33,
 };
 static HWND g_tb = nullptr;
-static HFONT g_tbFont = nullptr;  // 「文」图标用的字体，只创建一次
 static int  g_tbHot = 0;    // 悬停的按钮
 static int  g_tbPress = 0;  // 已按下尚未松开的按钮
 static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l);  // TbCreate 需要
 
-static HFONT TbFont() {
-    if (!g_tbFont) {
-        g_tbFont = CreateFontW(-20, 0, 0, 0, FW_BOLD, 0, 0, 0,
-                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                               CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                               DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
-    }
-    return g_tbFont;
-}
-
 static RECT TbButtonRect(int id) {
     if (id >= kTbRect && id <= kTbText) {
         const int x = kTbPad + (id - kTbRect) * kTbStep;
-        return { x, 4, x + kTbBtn, 4 + kTbBtn };
+        return { x, kTbBtnY, x + kTbBtn, kTbBtnY + kTbBtn };
     }
-    if (id == kTbSave) return { kTbSaveX, 4, kTbSaveX + kTbBtn, 4 + kTbBtn };
+    if (id == kTbSave) return { kTbSaveX, kTbBtnY, kTbSaveX + kTbBtn, kTbBtnY + kTbBtn };
     if (id >= kTbColor0 && id <= kTbColor5) {
         const int cx = kTbSwX0 + (id - kTbColor0) * kTbSwStep;
-        return { cx - kTbHit / 2, 20 - kTbHit / 2, cx + kTbHit / 2, 20 + kTbHit / 2 };
+        return { cx - kTbHit / 2, kTbMidY - kTbHit / 2, cx + kTbHit / 2, kTbMidY + kTbHit / 2 };
     }
     if (id >= kTbWidth0 && id <= kTbWidth3) {
         const int cx = kTbWdX0 + (id - kTbWidth0) * kTbWdStep;
-        return { cx - kTbHit / 2, 20 - kTbHit / 2, cx + kTbHit / 2, 20 + kTbHit / 2 };
+        return { cx - kTbHit / 2, kTbMidY - kTbHit / 2, cx + kTbHit / 2, kTbMidY + kTbHit / 2 };
     }
     return { 0, 0, 0, 0 };
 }
@@ -1518,82 +1561,123 @@ static void TbCreate() {
                             WS_POPUP, 0, 0, kTbW, kTbH,
                             NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!g_tb) return;
+    // 窗口自身也裁成圆角（半径 20 = 条底圆角 10 的两倍）：否则条底圆角之外那 4 个
+    // 小三角是窗口底色（白），在深色桌面上会露出直角。view.cpp 的工具栏同款做法。
+    SetWindowRgn(g_tb, CreateRoundRectRgn(0, 0, kTbW + 1, kTbH + 1, 20, 20), FALSE);
     g_tbHot = 0;
     g_tbPress = 0;
     TbReposition();
     ShowWindow(g_tb, SW_SHOWNOACTIVATE);
 }
 
-// 图标全部用 GDI 画：不引图片资源（资源一多，单文件部署就要跟着改）、不引 GDI+。
-// 局部坐标系是 0..17 的 18x18 方格，整体平移到按钮里 (btn.left+7, btn.top+7)。
-static void TbDrawIcon(HDC dc, int id, const RECT& btn, COLORREF c) {
-    const int ox = btn.left + 7, oy = btn.top + 7;
-    HPEN pen2 = CreatePen(PS_SOLID, 2, c);
-    HPEN pen4 = CreatePen(PS_SOLID, 4, c);
-    HGDIOBJ oldPen = SelectObject(dc, pen2);
-    HGDIOBJ oldBr  = SelectObject(dc, GetStockObject(NULL_BRUSH));
+// 圆角矩形路径（条底 / 选中底 / 矩形图标共用）。写法与 view.cpp 的 TbRoundPath 一致。
+static void TbRoundPath(gp::GraphicsPath& p, const gp::RectF& r, float rad) {
+    const float d = rad * 2;
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+
+// 图标全部用 GDI+ 画（抗锯齿）：不引图片资源（资源一多，单文件部署就要跟着改）。
+// 线形图标统一 3.2f 圆头圆角；坐标以按钮中心 (cx, cy) 为基准、在 38x38 的框里设计
+// （用户要求"图标也变高"：旧的是 18x18 里的 22x16 扁框）。
+// 注意：这里只画工具栏自己的窗口 DC，绝不碰 g.bits —— 遮罩层要 alpha 恒 255。
+static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
+                       const gp::Color& ink) {
+    gp::Pen pen(ink, 3.2f);
+    pen.SetStartCap(gp::LineCapRound);
+    pen.SetEndCap(gp::LineCapRound);
+    pen.SetLineJoin(gp::LineJoinRound);
     switch (id) {
-        case kTbRect:
-            // RoundRect 后两参是"角椭圆的宽高"，8 → 圆角半径 4
-            RoundRect(dc, ox + 1, oy + 1, ox + 17, oy + 17, 8, 8);
+        case kTbRect: {
+            gp::GraphicsPath rp;
+            TbRoundPath(rp, gp::RectF(cx - 13, cy - 11, 26, 22), 5.5f);
+            gr.DrawPath(&pen, &rp);
             break;
+        }
         case kTbEllipse:
-            Ellipse(dc, ox + 1, oy + 1, ox + 17, oy + 17);
+            gr.DrawEllipse(&pen, gp::RectF(cx - 13, cy - 11, 26, 22));
             break;
-        case kTbArrow:
-            MoveToEx(dc, ox + 3, oy + 15, NULL);
-            LineTo(dc, ox + 15, oy + 3);
-            LineTo(dc, ox + 7, oy + 3);         // 上翼
-            MoveToEx(dc, ox + 15, oy + 3, NULL);
-            LineTo(dc, ox + 15, oy + 11);       // 下翼
+        case kTbArrow: {
+            const gp::PointF A(cx - 12, cy + 12);
+            const gp::PointF B(cx + 12, cy - 12);
+            gr.DrawLine(&pen, A, B);
+            const double ang = std::atan2((double)(B.Y - A.Y), (double)(B.X - A.X));
+            for (int k = -1; k <= 1; k += 2) {
+                const double a2 = ang + 3.14159265358979 + k * 0.5;
+                gr.DrawLine(&pen, B, gp::PointF(B.X + (gp::REAL)(11 * std::cos(a2)),
+                                                B.Y + (gp::REAL)(11 * std::sin(a2))));
+            }
             break;
+        }
         case kTbPen: {
-            SelectObject(dc, pen4);
-            MoveToEx(dc, ox + 8, oy + 12, NULL);   // 笔身
-            LineTo(dc, ox + 14, oy + 6);
-            // 笔尖：一个小实心三角，视觉上凑成一枝笔
-            SelectObject(dc, GetStockObject(NULL_PEN));
-            HBRUSH b = CreateSolidBrush(c);
-            HGDIOBJ ob = SelectObject(dc, b);
-            POINT tip[3] = { { ox + 2, oy + 16 }, { ox + 3, oy + 10 }, { ox + 8, oy + 15 } };
-            Polygon(dc, tip, 3);
-            SelectObject(dc, ob);
-            DeleteObject(b);
+            // 微信铅笔：细长笔杆 + 圆弧尾端 + 实心三角笔尖（结构照抄 view.cpp，坐标按 38 框重算）
+            const gp::PointF T(cx - 8.5f, cy + 10.5f);   // 笔尖顶点（左下）
+            const gp::PointF E(cx + 9.5f, cy - 8.5f);    // 尾端中心（右上）
+            const float dx = E.X - T.X, dy = E.Y - T.Y;
+            const float len = std::sqrt(dx * dx + dy * dy);
+            const float ux = dx / len, uy = dy / len;    // 轴向单位向量
+            const float px = -uy, py = ux;               // 垂直向单位向量
+            const float w = 3.3f, tip = 7.5f;
+            const gp::PointF B1(T.X + ux * tip + px * w, T.Y + uy * tip + py * w);
+            const gp::PointF B2(T.X + ux * tip - px * w, T.Y + uy * tip - py * w);
+            const gp::PointF A2(E.X - px * w, E.Y - py * w);
+            // 笔杆轮廓：起点 A1(E + 垂直*w，由下面那条半圆弧隐式给出) -- A2 -- B2 -- B1
+            // （B1-B2 一侧开口，由实心笔尖盖住）
+            gp::GraphicsPath body;
+            const float a0 = (float)(std::atan2(py, px) * 180.0 / 3.14159265358979);
+            body.AddArc(gp::RectF(E.X - w, E.Y - w, 2 * w, 2 * w), a0, -180.0f);
+            body.AddLine(A2.X, A2.Y, B2.X, B2.Y);
+            body.AddLine(B2.X, B2.Y, B1.X, B1.Y);
+            body.CloseFigure();
+            gr.DrawPath(&pen, &body);
+            const gp::PointF tri[3] = { T, B1, B2 };
+            gp::SolidBrush tb(ink);
+            gr.FillPolygon(&tb, tri, 3);
+            // 尾部（橡皮端）分隔线
+            gr.DrawLine(&pen,
+                        gp::PointF(E.X - ux * 7 + px * w, E.Y - uy * 7 + py * w),
+                        gp::PointF(E.X - ux * 7 - px * w, E.Y - uy * 7 - py * w));
             break;
         }
         case kTbText: {
-            // 图标必须是"文"字本身，画线画不像
-            HGDIOBJ of = SelectObject(dc, TbFont());
-            const int oldMode = SetBkMode(dc, TRANSPARENT);
-            const COLORREF oldClr = SetTextColor(dc, c);
-            RECT r{ ox - 2, oy - 4, ox + 20, oy + 20 };
-            DrawTextW(dc, L"文", -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SetTextColor(dc, oldClr);
-            SetBkMode(dc, oldMode);
-            SelectObject(dc, of);
+            // 「文」字：MeasureString 精确居中。/permissive 下不能对临时对象取地址，
+            // 且 FontFamily 必须先于 Font 构造、晚于 Font 析构 → 一并 static。
+            static gp::FontFamily ffText(L"Microsoft YaHei");
+            static gp::Font fText(&ffText, 26, gp::FontStyleRegular, gp::UnitPixel);
+            gp::SolidBrush tb(ink);
+            gp::StringFormat sf;
+            sf.SetAlignment(gp::StringAlignmentCenter);
+            sf.SetLineAlignment(gp::StringAlignmentCenter);
+            gp::RectF meas;
+            gr.MeasureString(L"文", 1, &fText, gp::PointF(0.f, 0.f), &sf, &meas);
+            const float fx = cx - meas.Width / 2 - meas.X;
+            const float fy = cy - meas.Height / 2 - meas.Y;
+            gr.DrawString(L"文", -1, &fText, gp::PointF(fx, fy), &sf, &tb);
             break;
         }
-        case kTbSave:                              // "下载"：竖杆 + 双翼 + 托盘
-            MoveToEx(dc, ox + 9, oy + 2, NULL);
-            LineTo(dc, ox + 9, oy + 13);
-            MoveToEx(dc, ox + 4, oy + 8, NULL);
-            LineTo(dc, ox + 9, oy + 13);
-            MoveToEx(dc, ox + 14, oy + 8, NULL);
-            LineTo(dc, ox + 9, oy + 13);
-            MoveToEx(dc, ox + 2, oy + 16, NULL);
-            LineTo(dc, ox + 16, oy + 16);
-            MoveToEx(dc, ox + 2, oy + 12, NULL);
-            LineTo(dc, ox + 2, oy + 16);
-            MoveToEx(dc, ox + 16, oy + 12, NULL);
-            LineTo(dc, ox + 16, oy + 16);
+        case kTbSave: {
+            // 「下载」：向下箭头 + 下方托盘。托盘两个下角用圆弧过渡、两端圆头。
+            const gp::PointF tip(cx, cy + 3.5f);
+            gr.DrawLine(&pen, gp::PointF(cx, cy - 9.5f), tip);
+            gr.DrawLine(&pen, gp::PointF(cx - 7.5f, cy - 2.0f), tip);
+            gr.DrawLine(&pen, gp::PointF(cx + 7.5f, cy - 2.0f), tip);
+            const float bx0 = cx - 9.5f, bx1 = cx + 9.5f;
+            const float bTop = cy + 5.5f, bBot = cy + 10.5f, rr = 3.8f;
+            gp::GraphicsPath tray;
+            tray.AddLine(bx0, bTop, bx0, bBot - rr);
+            tray.AddArc(bx0, bBot - 2 * rr, 2 * rr, 2 * rr, 180, -90);
+            tray.AddLine(bx0 + rr, bBot, bx1 - rr, bBot);
+            tray.AddArc(bx1 - 2 * rr, bBot - 2 * rr, 2 * rr, 2 * rr, 90, -90);
+            tray.AddLine(bx1, bBot - rr, bx1, bTop);
+            gr.DrawPath(&pen, &tray);
             break;
+        }
         default:
             break;
     }
-    SelectObject(dc, oldBr);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen2);
-    DeleteObject(pen4);
 }
 
 static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1605,123 +1689,101 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             HDC mem = CreateCompatibleDC(dc);
             HBITMAP mb = CreateCompatibleBitmap(dc, kTbW, kTbH);
             HGDIOBJ ob = SelectObject(mem, mb);
+            // 先把整窗刷成纯白：GDI+ 是"叠在 DC 上"画，没画到的区域会露出黑
             HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
             FillRect(mem, &rc, bg);
             DeleteObject(bg);
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(210, 214, 220));
-            HGDIOBJ op = SelectObject(mem, pen);
-            HGDIOBJ obr = SelectObject(mem, GetStockObject(NULL_BRUSH));
-            Rectangle(mem, 0, 0, kTbW, kTbH);
-            SelectObject(mem, obr);
-            SelectObject(mem, op);
-            DeleteObject(pen);
 
-            // 两条分组竖线：五组挤在一行 40px 里，没有线就分不出"工具/保存/颜色/粗细"
-            HBRUSH sepB = CreateSolidBrush(RGB(228, 231, 236));
-            RECT v1{ kTbSep1, 8, kTbSep1 + 1, 32 };
-            RECT v2{ kTbSep2, 8, kTbSep2 + 1, 32 };
-            FillRect(mem, &v1, sepB);
-            FillRect(mem, &v2, sepB);
-            DeleteObject(sepB);
+            {
+                gp::Graphics gr(mem);
+                gr.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+                const gp::Color ink(255, 62, 66, 72);
 
-            // ---- 工具 + 保存：32x32 圆角底 + 图标 ----
-            for (int id = kTbRect; id <= kTbSave; ++id) {
-                RECT r = TbButtonRect(id);
-                const bool hover   = (g_tbHot == id);
-                const bool pressed = (g_tbPress == id);
-                const bool active  = (id <= kTbText) && (g.annTool == AT_RECT + (id - kTbRect));
-                COLORREF fill = 0, icon = RGB(60, 60, 60);
-                bool hasFill = true;
-                if (id == kTbSave) {
-                    // 主按钮：一直有底，图标恒蓝（这是唯一"会结束截图"的键）
-                    fill = pressed ? RGB(210, 216, 224)
-                                   : (hover ? RGB(225, 228, 232) : RGB(240, 242, 245));
-                    icon = RGB(0, 120, 215);
-                } else if (pressed) {
-                    fill = RGB(210, 216, 224);
-                    icon = active ? RGB(0, 120, 215) : RGB(60, 60, 60);
-                } else if (active) {
-                    fill = RGB(219, 229, 241);
-                    icon = RGB(0, 120, 215);
-                } else if (hover) {
-                    fill = RGB(240, 242, 245);
-                } else {
-                    hasFill = false;          // 静息态：不画底，直接白底 + 深灰图标
+                // ---- 条底：白底圆角 + 1.2px 浅灰描边（圆角由 TbCreate 的窗口 Rgn 兜外沿）----
+                {
+                    gp::GraphicsPath path;
+                    TbRoundPath(path, gp::RectF(0.0f, 0.0f, (float)kTbW, (float)kTbH), 10.0f);
+                    gp::SolidBrush white(gp::Color(255, 255, 255, 255));
+                    gr.FillPath(&white, &path);
+                    gp::Pen border(gp::Color(255, 224, 227, 231), 1.2f);
+                    gr.DrawPath(&border, &path);
                 }
-                if (hasFill) {
-                    HBRUSH bb = CreateSolidBrush(fill);
-                    HGDIOBJ op2 = SelectObject(mem, GetStockObject(NULL_PEN));
-                    HGDIOBJ ob2 = SelectObject(mem, bb);
-                    // 圆角 4（RoundRect 的角椭圆宽高取 8）
-                    RoundRect(mem, r.left, r.top, r.right, r.bottom, 8, 8);
-                    SelectObject(mem, ob2);
-                    SelectObject(mem, op2);
-                    DeleteObject(bb);
+                // ---- 两条分组竖线：没有线就分不出"工具|保存|颜色|粗细" ----
+                {
+                    gp::Pen dv(gp::Color(255, 226, 229, 233), 1.4f);
+                    dv.SetStartCap(gp::LineCapRound);
+                    dv.SetEndCap(gp::LineCapRound);
+                    gr.DrawLine(&dv, gp::PointF((float)kTbSep1 + 1, 12.0f),
+                                     gp::PointF((float)kTbSep1 + 1, 36.0f));
+                    gr.DrawLine(&dv, gp::PointF((float)kTbSep2 + 1, 12.0f),
+                                     gp::PointF((float)kTbSep2 + 1, 36.0f));
                 }
-                TbDrawIcon(mem, id, r, icon);
-            }
 
-            // ---- 颜色圆点：直径 18，白/浅色加 1px 灰描边，选中外圈再套 2px 蓝环 ----
-            for (int id = kTbColor0; id <= kTbColor5; ++id) {
-                RECT r = TbButtonRect(id);
-                const int cx = (r.left + r.right) / 2;
-                const int cy = (r.top + r.bottom) / 2;
-                const int ci = id - kTbColor0;
-                const int cr = kAnnColors[ci][0], cg = kAnnColors[ci][1], cb = kAnnColors[ci][2];
-                if (g.annColor == ci) {
-                    HPEN rp = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
-                    HGDIOBJ op2 = SelectObject(mem, rp);
-                    HGDIOBJ ob2 = SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    const int rr = kTbSwR + 3;
-                    Ellipse(mem, cx - rr, cy - rr, cx + rr, cy + rr);
-                    SelectObject(mem, ob2);
-                    SelectObject(mem, op2);
-                    DeleteObject(rp);
+                // ---- 工具 + 保存：38x38 格子，选中/悬停时垫一层内缩 3px 的圆角底 ----
+                for (int id = kTbRect; id <= kTbSave; ++id) {
+                    RECT r = TbButtonRect(id);
+                    const bool hover   = (g_tbHot == id);
+                    const bool pressed = (g_tbPress == id);
+                    const bool active  = (id <= kTbText) && (g.annTool == AT_RECT + (id - kTbRect));
+                    // 保存键**没有**常驻底色了（用户："下载为什么默认有蓝色的背景色块？去掉"），
+                    // 只有 hover/press 才画底，和工具按钮走同一套。
+                    if (hover || pressed || active) {
+                        gp::GraphicsPath path;
+                        TbRoundPath(path,
+                                    gp::RectF((float)r.left + 3, (float)r.top + 3,
+                                              (float)kTbBtn - 6, (float)kTbBtn - 6), 8.0f);
+                        gp::SolidBrush b(pressed ? gp::Color(255, 212, 216, 222)
+                                         : active ? gp::Color(255, 229, 232, 236)
+                                                  : gp::Color(255, 243, 244, 246));
+                        gr.FillPath(&b, &path);
+                    }
+                    TbDrawIcon(gr, id, (r.left + r.right) / 2.0f,
+                               (r.top + r.bottom) / 2.0f, ink);
                 }
-                HBRUSH bb = CreateSolidBrush(RGB(cr, cg, cb));
-                HGDIOBJ op3 = SelectObject(mem, GetStockObject(NULL_PEN));
-                HGDIOBJ ob3 = SelectObject(mem, bb);
-                Ellipse(mem, cx - kTbSwR, cy - kTbSwR, cx + kTbSwR, cy + kTbSwR);
-                SelectObject(mem, ob3);
-                SelectObject(mem, op3);
-                DeleteObject(bb);
-                // 亮度 > 160 的（白、黄）在白底上几乎看不见，补一圈 1px 灰边
-                if ((cr * 299 + cg * 587 + cb * 114) / 1000 > 160) {
-                    HPEN ep = CreatePen(PS_SOLID, 1, RGB(205, 208, 214));
-                    HGDIOBJ op4 = SelectObject(mem, ep);
-                    HGDIOBJ ob4 = SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, cx - kTbSwR, cy - kTbSwR, cx + kTbSwR, cy + kTbSwR);
-                    SelectObject(mem, ob4);
-                    SelectObject(mem, op4);
-                    DeleteObject(ep);
-                }
-            }
 
-            // ---- 粗细圆点：半径 2/3/4/6 对应 2/4/6/9；选中变蓝并垫一层浅蓝圆角底 ----
-            for (int id = kTbWidth0; id <= kTbWidth3; ++id) {
-                RECT r = TbButtonRect(id);
-                const int cx = (r.left + r.right) / 2;
-                const int cy = (r.top + r.bottom) / 2;
-                const int wi = id - kTbWidth0;
-                const bool sel = (g.annWidthIdx == wi);
-                if (sel) {
-                    HBRUSH sb = CreateSolidBrush(RGB(219, 229, 241));
-                    HGDIOBJ op2 = SelectObject(mem, GetStockObject(NULL_PEN));
-                    HGDIOBJ ob2 = SelectObject(mem, sb);
-                    RoundRect(mem, cx - 10, cy - 10, cx + 10, cy + 10, 8, 8);
-                    SelectObject(mem, ob2);
-                    SelectObject(mem, op2);
-                    DeleteObject(sb);
+                // ---- 颜色圆点：6 个一律直径 22，不再给选中项套更大的环 ----
+                // 用户说的"大大小小不统一"就是那圈环造成的；选中改成在圆点后面垫 28x28
+                // 浅蓝圆角方块，圆点本身大小一个像素都不变。
+                for (int id = kTbColor0; id <= kTbColor5; ++id) {
+                    RECT r = TbButtonRect(id);
+                    const float cx = (r.left + r.right) / 2.0f;
+                    const float cy = (r.top + r.bottom) / 2.0f;
+                    const int ci = id - kTbColor0;
+                    const int cr = kAnnColors[ci][0], cg = kAnnColors[ci][1], cb = kAnnColors[ci][2];
+                    if (g.annColor == ci) {
+                        gp::GraphicsPath path;
+                        TbRoundPath(path, gp::RectF(cx - 14, cy - 14, 28, 28), 8.0f);
+                        gp::SolidBrush sb(gp::Color(255, 219, 229, 241));
+                        gr.FillPath(&sb, &path);
+                    }
+                    gp::SolidBrush b(gp::Color(255, (BYTE)cr, (BYTE)cg, (BYTE)cb));
+                    gr.FillEllipse(&b, cx - kTbSwR, cy - kTbSwR,
+                                   2.0f * kTbSwR, 2.0f * kTbSwR);
+                    // 亮度 > 160 的（白、黄）在白底上看不见，补一圈 1px 灰边
+                    if ((cr * 299 + cg * 587 + cb * 114) / 1000 > 160) {
+                        gp::Pen ep(gp::Color(255, 205, 208, 214), 1.0f);
+                        gr.DrawEllipse(&ep, cx - kTbSwR, cy - kTbSwR,
+                                       2.0f * kTbSwR, 2.0f * kTbSwR);
+                    }
                 }
-                static const int kDotR[4] = { 2, 3, 4, 6 };
-                const int dr = kDotR[wi];
-                HBRUSH bb = CreateSolidBrush(sel ? RGB(0, 120, 215) : RGB(70, 70, 70));
-                HGDIOBJ op3 = SelectObject(mem, GetStockObject(NULL_PEN));
-                HGDIOBJ ob3 = SelectObject(mem, bb);
-                Ellipse(mem, cx - dr, cy - dr, cx + dr, cy + dr);
-                SelectObject(mem, ob3);
-                SelectObject(mem, op3);
-                DeleteObject(bb);
+
+                // ---- 粗细圆点：半径 5/7/9.5/12（旧的 8/12/16/20 直径 × 1.2）----
+                static const float kDotR[4] = { 5.0f, 7.0f, 9.5f, 12.0f };
+                for (int id = kTbWidth0; id <= kTbWidth3; ++id) {
+                    RECT r = TbButtonRect(id);
+                    const float cx = (r.left + r.right) / 2.0f;
+                    const float cy = (r.top + r.bottom) / 2.0f;
+                    const int wi = id - kTbWidth0;
+                    if (g.annWidthIdx == wi) {
+                        gp::GraphicsPath path;
+                        TbRoundPath(path, gp::RectF(cx - 14, cy - 14, 28, 28), 8.0f);
+                        gp::SolidBrush sb(gp::Color(255, 219, 229, 241));
+                        gr.FillPath(&sb, &path);
+                    }
+                    gp::SolidBrush b(ink);
+                    gr.FillEllipse(&b, cx - kDotR[wi], cy - kDotR[wi],
+                                   2.0f * kDotR[wi], 2.0f * kDotR[wi]);
+                }
             }
 
             BitBlt(dc, 0, 0, kTbW, kTbH, mem, 0, 0, SRCCOPY);

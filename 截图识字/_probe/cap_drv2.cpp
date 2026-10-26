@@ -69,10 +69,10 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 //   颜色 20..25 中心 x = 247+26i
 //   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 247 + 26 * (id - 20), 20 };
-    if (id >= 30 && id <= 33) return POINT{ 416 + 26 * (id - 30), 20 };
-    static const int cx[9] = { 0, 24, 58, 92, 126, 160, 204, 0, 0 };
-    return POINT{ cx[id], 20 };
+    if (id >= 20 && id <= 25) return POINT{ 307 + 31 * (id - 20), 24 };
+    if (id >= 30 && id <= 33) return POINT{ 511 + 31 * (id - 30), 24 };
+    static const int cx[9] = { 0, 29, 71, 113, 155, 197, 249, 0, 0 };
+    return POINT{ cx[id], 24 };
 }
 
 static void ClickTb(HWND tb, int id) {
