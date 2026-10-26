@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cstdlib>   // std::abs
 #include <cstdio>    // std::snprintf
+#include <cmath>     // cos / sin / atan2 / lround（自写光栅化用）
+#include <utility>   // std::move（OverlayState 里的标注 vector 每帧搬一次）
 
 // GET_X_LPARAM/GET_Y_LPARAM normally live in <windowsx.h>, but that header
 // tends to clash with other definitions. Define them locally to stay safe.
@@ -42,6 +44,28 @@ static void EnsureDpi() {
 //   Adjust —— 选区已定，可拖八个把手微调；ESC / 保存 = 裁剪并写入剪贴板后退出。
 enum class Phase { Select, Adjust };
 
+// ---- 原地标注（矩形 / 椭圆 / 箭头 / 画笔）----
+// 坐标一律用**绝对虚拟屏坐标**，不是相对选区的坐标：截图内容是一张静止的画面，
+// 标注必须"画在哪就钉在哪个屏幕像素"。这样之后拖把手改选区，标注不会跟着乱跑；
+// 被缩掉的那部分在保存时自然被裁掉。
+enum { AT_NONE = 0, AT_RECT, AT_ELLIPSE, AT_ARROW, AT_PEN };
+constexpr int kAnnColors[6][3] = {   // 与 view.cpp 保持一致，别改数值
+    { 230,  60,  60},   // 红（默认）
+    { 245, 200,  40},   // 黄
+    {  50, 130, 245},   // 蓝
+    {  40, 180,  90},   // 绿
+    {  35,  35,  35},   // 黑
+    { 255, 255, 255},   // 白
+};
+constexpr int kAnnWidths[4] = { 2, 4, 6, 9 };
+
+struct Anno {
+    int tool = AT_NONE;
+    int color = 0;              // kAnnColors 下标
+    int widthIdx = 0;           // kAnnWidths 下标
+    std::vector<POINT> pts;     // 绝对虚拟屏坐标；RECT/ELLIPSE/ARROW 恒 2 个点，PEN 是整条路径
+};
+
 // 截图遮罩层状态（提前定义，供 EnumWnd 使用虚拟屏幕尺寸过滤窗口）。
 struct Cap {
     HWND w = nullptr;
@@ -50,6 +74,13 @@ struct Cap {
     bool saveToClip = false;  // 退出时把裁剪结果写进剪贴板（ESC / 保存）
     bool ocrWanted  = false;  // 退出时对裁剪结果跑 OCR，并把文字也写进剪贴板（点"识别文字"）
     bool drag = false;
+    // ---- 原地标注 ----
+    std::vector<Anno> annos;   // 已完成的标注（绝对虚拟屏坐标）
+    Anno  annCur;              // 正在画的那一条
+    bool  drawingAnn = false;
+    int   annTool = AT_NONE;   // 当前选中的工具；AT_NONE = 不在标注模式
+    int   annColor = 0;
+    int   annWidthIdx = 0;
     POINT start = {0,0};
     POINT cur = {0,0}; // current mouse pos in virtual-screen coords
     RECT sel = {0,0,0,0};
@@ -294,6 +325,17 @@ struct OverlayState {
     bool labelValid = false;
     bool drag = false;          // 决定边框颜色（蓝=悬停 / 红=拖拽）
     bool adjust = false;        // 调整态：画八个把手，且脏区 footprint 要外扩
+    // ---- 原地标注 ----
+    // 按值存放（不是指针/版本号）：SameOverlay 的判据是"画 a 与画 b 是否逐像素
+    // 相同"，而标注的内容就是画面的一部分，逐条逐点比较才是那个判据本身。
+    // 代价是每帧两次 vector 拷贝（BuildOverlayState 一次、g_prev = next 一次），
+    // 一笔 5000 点的长笔画也就 40KB —— 比"漏比导致残影"便宜得多。
+    std::vector<Anno> annos;    // 已完成的标注（绝对虚拟屏坐标）
+    Anno annCur;                // 正在画的那一条
+    bool drawingAnn = false;
+    RECT annBox{0, 0, 0, 0};    // 所有标注的墨迹外接框（窗口坐标）∩ hole。
+                                // 只用于算脏区（见 Redraw 的 extra），不进 StateRegion：
+                                // 它按构造是 hole 的子集，而 hole 本来就在 StateRegion 里。
 };
 static OverlayState g_prev;
 static bool g_prevValid = false;
@@ -321,6 +363,21 @@ static inline RECT RUnion(const RECT& a, const RECT& b) {
     r.right = std::max(a.right, b.right); r.bottom = std::max(a.bottom, b.bottom);
     return r;
 }
+static bool SameAnno(const Anno& a, const Anno& b) {
+    if (a.tool != b.tool || a.color != b.color || a.widthIdx != b.widthIdx) return false;
+    if (a.pts.size() != b.pts.size()) return false;
+    for (size_t i = 0; i < a.pts.size(); ++i) {
+        if (a.pts[i].x != b.pts[i].x || a.pts[i].y != b.pts[i].y) return false;
+    }
+    return true;
+}
+static bool SameAnnos(const std::vector<Anno>& a, const std::vector<Anno>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!SameAnno(a[i], b[i])) return false;
+    }
+    return true;
+}
 static bool SameOverlay(const OverlayState& a, const OverlayState& b) {
     if (a.drag != b.drag || a.labelValid != b.labelValid) return false;
     // 进入/离开调整态会整体出现或消失八个把手，且 footprint 也会变（外扩 kHandleH）
@@ -331,7 +388,31 @@ static bool SameOverlay(const OverlayState& a, const OverlayState& b) {
         a.label.right != b.label.right || a.label.bottom != b.label.bottom) return false;
     // 标签矩形没动但文字变了（拖动时最常见：框没动、尺寸数字在跳），这一帧必须重画。
     if (a.labelValid && std::strncmp(a.text, b.text, sizeof(a.text)) != 0) return false;
+    // 标注：逐条逐点比，不用哈希（哈希碰撞会让"变了"被误判成"没变"，那是永久残影）。
+    // annBox 完全由 annos/annCur/hole 推出，不重复比较。
+    if (a.drawingAnn != b.drawingAnn) return false;
+    if (!SameAnnos(a.annos, b.annos)) return false;
+    if (a.drawingAnn && !SameAnno(a.annCur, b.annCur)) return false;
     return true;
+}
+
+// 标注的墨迹外接框（绝对虚拟屏坐标）。只加不减：框大了只是多画一块（幂等），
+// 框小了就是漏画 → 屏幕上留残影。
+static void GrowAnnoBox(RECT& box, const Anno& a) {
+    if (a.pts.empty()) return;
+    const int wi = (a.widthIdx < 0) ? 0 : (a.widthIdx > 3 ? 3 : a.widthIdx);
+    const int w = kAnnWidths[wi];
+    int pad = w / 2 + 1;                 // 半笔宽 + 1px 锯齿余量
+    if (a.tool == AT_ARROW && a.pts.size() >= 2) {
+        // 箭头两翼从尖端往回张开 28°，垂直于主干方向最多甩出 0.47·len；主干水平时
+        // 这一截整个落在两点包围盒之外，必须显式补进来。
+        pad += std::max(10, 5 * w);
+    }
+    for (size_t i = 0; i < a.pts.size(); ++i) {
+        RECT r{ a.pts[i].x - pad, a.pts[i].y - pad,
+                a.pts[i].x + pad + 1, a.pts[i].y + pad + 1 };
+        box = RUnion(box, r);
+    }
 }
 
 // 由当前交互状态算出本帧要画什么（窗口坐标：减去虚拟屏原点）
@@ -339,6 +420,9 @@ static OverlayState BuildOverlayState() {
     OverlayState s;
     s.drag = g.drag;
     s.adjust = (g.phase == Phase::Adjust);
+    s.annos = g.annos;
+    s.annCur = g.annCur;
+    s.drawingAnn = g.drawingAnn;
     RECT hole = { 0, 0, 0, 0 };
     if (g.phase == Phase::Adjust) {
         // 调整态：洞就是选区本身，绝不能再跟着鼠标下面的窗口跑
@@ -381,6 +465,20 @@ static OverlayState BuildOverlayState() {
         RECT lb = { tx - pad, ty - pad, tx + ts.cx + pad, ty + ts.cy + pad };
         s.label = RIntersect(lb, RECT{0, 0, g.vw, g.vh});
         s.labelValid = !REmpty(s.label);
+    }
+
+    // 标注足迹。与洞求交，而不是"外扩"：墨迹是钳在选区里画的，裁剪也只会保留
+    // 选区那一块，所以预览必须与"保存出来的那张"逐像素一致 —— 画到选区外的
+    // 部分本来就存不下来，预览里也不该露出来。
+    {
+        RECT ab{ 0, 0, 0, 0 };
+        for (size_t i = 0; i < g.annos.size(); ++i) GrowAnnoBox(ab, g.annos[i]);
+        if (g.drawingAnn) GrowAnnoBox(ab, g.annCur);
+        if (!REmpty(ab)) {
+            ab.left -= g.vx; ab.right -= g.vx;
+            ab.top  -= g.vy; ab.bottom -= g.vy;
+            s.annBox = RIntersect(ab, s.hole);
+        }
     }
     return s;
 }
@@ -579,6 +677,148 @@ static void PaintHandles(const RECT& band, const OverlayState& s) {
     }
 }
 
+// ---- 标注绘制：自写像素光栅化 ----
+// 为什么不用 GDI 画：① GDI 会把线条/字形的 alpha 写成 0 或半透明，而 g.bits 的
+// 不变量是"被画到的像素 alpha 一律 255"（漏修补是**永久**透明斑，不是闪一帧）；
+// ② 同一套图形还要往最终截图（24bpp RGB、没有 alpha 通道）上再画一遍，用 GDI 就得
+// 维护两套 DC/位图/DPI 缩放，两边像素对不齐；③ 逐像素写才能顺手把"只在 band 内、
+// 只在洞内"的裁剪做进同一个函数，不会画脏持久缓冲。
+struct Surf {
+    BYTE* px = nullptr;
+    int   stride = 0;          // 每行字节数
+    int   bpp = 4;             // 4 = 遮罩层 BGRA；3 = 最终截图 RGB（无 alpha）
+    bool  bgr = true;          // 4bpp 是 BGRA；3bpp 的 CaptureImage.rgb 是 RGB 顺序
+    int   w = 0, h = 0;        // 像素尺寸
+    int   ox = 0, oy = 0;      // 绘制坐标 → 像素坐标的偏移（绝对屏幕坐标 - ox/oy）
+    RECT  clip{ 0, 0, 0, 0 };  // 绘制坐标系下的裁剪矩形（左闭右开）
+};
+
+static inline void SPut(Surf& s, int x, int y, const int c[3]) {
+    if (x < s.clip.left || x >= s.clip.right || y < s.clip.top || y >= s.clip.bottom) return;
+    const int sx = x - s.ox, sy = y - s.oy;
+    if (sx < 0 || sy < 0 || sx >= s.w || sy >= s.h) return;
+    BYTE* p = s.px + (size_t)sy * s.stride + (size_t)sx * s.bpp;
+    if (s.bgr) { p[0] = (BYTE)c[2]; p[1] = (BYTE)c[1]; p[2] = (BYTE)c[0]; }
+    else       { p[0] = (BYTE)c[0]; p[1] = (BYTE)c[1]; p[2] = (BYTE)c[2]; }
+    if (s.bpp == 4) p[3] = 255;      // 不变量：被画到的像素一律不透明
+}
+
+// 粗线 = 沿 Bresenham 每步盖一个 w×w 的方章。用方章不用圆章：厚度精确等于 w
+// （半径 w/2 的圆章画出来是 w+1 厚），且斜线上相邻方章必然重叠，不会留锯齿缺口。
+static void SLine(Surf& s, int x0, int y0, int x1, int y1, int w, const int c[3]) {
+    if (w < 1) w = 1;
+    const int lo = -(w - 1) / 2;
+    const int hi = lo + w - 1;
+    // 整条线的包围盒都在裁剪区外 → 直接返回。长笔画配小 band 时这是主路径：
+    // 省掉的是 len×w² 次逐像素判断，否则一条横跨全屏的画笔会把 8 个 band 全拖慢。
+    if (std::max(x0, x1) + hi < s.clip.left || std::min(x0, x1) + lo >= s.clip.right ||
+        std::max(y0, y1) + hi < s.clip.top  || std::min(y0, y1) + lo >= s.clip.bottom) return;
+    int dx = std::abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        for (int a = lo; a <= hi; ++a) {
+            for (int b = lo; b <= hi; ++b) SPut(s, x0 + a, y0 + b, c);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        const int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void SRect(Surf& s, int x0, int y0, int x1, int y1, int w, const int c[3]) {
+    const int l = std::min(x0, x1), r = std::max(x0, x1);
+    const int t = std::min(y0, y1), b = std::max(y0, y1);
+    SLine(s, l, t, r, t, w, c);
+    SLine(s, l, b, r, b, w, c);
+    SLine(s, l, t, l, b, w, c);
+    SLine(s, r, t, r, b, w, c);
+}
+
+static void SEllipse(Surf& s, int x0, int y0, int x1, int y1, int w, const int c[3]) {
+    const int l = std::min(x0, x1), r = std::max(x0, x1);
+    const int t = std::min(y0, y1), b = std::max(y0, y1);
+    const double cx = (l + r) * 0.5, cy = (t + b) * 0.5;
+    const double rx = (r - l) * 0.5, ry = (b - t) * 0.5;
+    if (rx < 1.0 || ry < 1.0) { SLine(s, l, t, r, b, w, c); return; }  // 太扁：退化成线段
+    // 参数采样：周长 ≈ π·(rx+ry)，按每 1px 一个点取步数，下限 24 保证小椭圆也闭合。
+    int steps = (int)((rx + ry) * 3.2);
+    if (steps < 24) steps = 24;
+    if (steps > 4096) steps = 4096;
+    int px = 0, py = 0;
+    for (int i = 0; i <= steps; ++i) {
+        const double a = 6.283185307179586 * (double)i / (double)steps;
+        const int qx = (int)std::lround(cx + rx * std::cos(a));
+        const int qy = (int)std::lround(cy + ry * std::sin(a));
+        if (i == 0) { px = qx; py = qy; continue; }
+        if (qx != px || qy != py) SLine(s, px, py, qx, qy, w, c);   // 重复点跳过
+        px = qx; py = qy;
+    }
+}
+
+static void SArrow(Surf& s, int x0, int y0, int x1, int y1, int w, const int c[3]) {
+    SLine(s, x0, y0, x1, y1, w, c);                       // 主干：(x0,y0) → 箭头尖
+    const double ang = std::atan2((double)(y1 - y0), (double)(x1 - x0));
+    const int len = std::max(10, 5 * w);                  // 头部长度随笔宽放大，细笔也看得见
+    const double kA = 0.48869219;                         // 28°：两翼与主干的夹角
+    for (int k = -1; k <= 1; k += 2) {
+        const double a = ang + k * kA;
+        const int hx = (int)std::lround(x1 - len * std::cos(a));   // 从尖端往回画
+        const int hy = (int)std::lround(y1 - len * std::sin(a));
+        SLine(s, x1, y1, hx, hy, w, c);
+    }
+}
+
+static void PaintAnno(Surf& s, const Anno& a) {
+    if (a.tool == AT_NONE || a.pts.empty()) return;
+    const int ci = (a.color < 0) ? 0 : (a.color > 5 ? 5 : a.color);
+    const int wi = (a.widthIdx < 0) ? 0 : (a.widthIdx > 3 ? 3 : a.widthIdx);
+    const int* c = kAnnColors[ci];
+    const int w = kAnnWidths[wi];
+    if (a.tool == AT_PEN) {
+        if (a.pts.size() == 1) {   // 只点了一下：点一个方点，别什么都不画
+            SLine(s, a.pts[0].x, a.pts[0].y, a.pts[0].x, a.pts[0].y, w, c);
+            return;
+        }
+        for (size_t i = 1; i < a.pts.size(); ++i) {
+            SLine(s, a.pts[i - 1].x, a.pts[i - 1].y, a.pts[i].x, a.pts[i].y, w, c);
+        }
+        return;
+    }
+    if (a.pts.size() < 2) return;
+    const POINT p0 = a.pts[0], p1 = a.pts[1];
+    switch (a.tool) {
+        case AT_RECT:    SRect(s, p0.x, p0.y, p1.x, p1.y, w, c);    break;
+        case AT_ELLIPSE: SEllipse(s, p0.x, p0.y, p1.x, p1.y, w, c); break;
+        case AT_ARROW:   SArrow(s, p0.x, p0.y, p1.x, p1.y, w, c);   break;
+        default: break;
+    }
+}
+
+// 把标注画到遮罩层上（band 内、洞内）。两处裁剪缺一不可：
+//   · band：g.bits 是持久缓冲，画到 band 之外就是"没上传的脏像素"，下次别的 band
+//     上传时会把它当成旧内容留着；
+//   · hole：选区外是压暗的遮罩区，墨迹漏出去既穿帮、又存不进最终截图。
+static void PaintAnnos(const RECT& band, const OverlayState& s) {
+    if (REmpty(s.annBox)) return;
+    RECT clip = { band.left + g.vx, band.top + g.vy, band.right + g.vx, band.bottom + g.vy };
+    RECT hole = { s.hole.left + g.vx, s.hole.top + g.vy,
+                  s.hole.right + g.vx, s.hole.bottom + g.vy };
+    clip = RIntersect(clip, hole);
+    if (REmpty(clip)) return;
+    Surf su;
+    su.px = (BYTE*)g.bits;
+    su.stride = g.vw * 4;
+    su.bpp = 4;
+    su.bgr = true;
+    su.w = g.vw; su.h = g.vh;
+    su.ox = g.vx; su.oy = g.vy;
+    su.clip = clip;
+    for (size_t i = 0; i < s.annos.size(); ++i) PaintAnno(su, s.annos[i]);
+    if (s.drawingAnn) PaintAnno(su, s.annCur);   // 正在画的那一条也画，所见即所得
+}
+
 // 洞的「绘制足迹」：调整态要外扩 kHandleH，因为八个把手是跨洞边界画的，
 // 有一半在洞外。用**一个**外扩矩形表达（而不是 4 条 ring 带）是为了让
 // StateRegion 恒为「1 个洞矩形 + 1 个标签矩形」：脏区是前后两个状态的 XOR，
@@ -604,6 +844,9 @@ static HRGN StateRegion(const OverlayState& s) {
         CombineRgn(r, r, l, RGN_OR);
         DeleteObject(l);
     }
+    // 标注（s.annBox）故意不进这个区域：墨迹是按构造钳在洞内画的，annBox 是
+    // RIntersect(墨迹框, hole) 的子集，而洞已经在里面了 —— 加进来一次元素都不多。
+    // 标注的**内容**变化走 BuildDirtyBands 的 extra 参数（区域异或看不见它）。
     return r;
 }
 
@@ -627,7 +870,7 @@ static double BandCost(int n, long long area) {
 }
 
 static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
-                           RECT out[], int cap) {
+                           const RECT& extra, RECT out[], int cap) {
     HRGN ra = StateRegion(a);
     HRGN rb = StateRegion(b);
     HRGN d = CreateRectRgn(0, 0, 0, 0);
@@ -663,6 +906,15 @@ static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
         }
     }
     DeleteObject(ra); DeleteObject(rb); DeleteObject(d);
+
+    // 标注变更必须显式并进来：区域异或只看得见"区域不同"，看不见"同一个区域里的
+    // 像素不同"。矩形从小拖到大时两边外接框的并集没变、XOR 一个矩形都选不出来，
+    // 新增的那几条边就画不上去；反过来从大拖小，旧外框的像素全落在"新旧框的交集"
+    // 里，XOR 也是空 → 屏幕上的旧框永远留着。所以调用方把 RUnion(旧框, 新框) 传进来。
+    // 代价是这一帧按外接框面积而不是按"线"来重画，一个占满选区的大标注拖动时约
+    // 2~5ms/帧 —— 只在拖标注的那几十帧里出现，可以接受。
+    if (!REmpty(extra)) v.push_back(extra);
+
     if (v.empty()) return 0;
 
     // 贪心合并：先按"总成本是否下降"自愿合并，数量仍超上限就强行压到 cap。
@@ -739,19 +991,29 @@ static void Redraw() {
         bands[0] = RECT{ 0, 0, g.vw, g.vh };
         n = 1;
     } else {
-        n = BuildDirtyBands(g_prev, next, bands, kBandCap);
-        if (n <= 0) { g_prev = next; return; }
+        // 标注的前后足迹并集：内容变了（新增/撤销/正在画）时区域异或选不出脏区，
+        // 必须靠它兜底，理由见 BuildDirtyBands 里那段注释。
+        RECT extra = RUnion(g_prev.annBox, next.annBox);
+        // 同一类漏点，标签也有：尺寸数字变了但标签矩形一字不差时（"120 x 80" 之后
+        // 全是 3 位数，字宽不变 → 矩形不变），异或为空 → 这帧被判成"没东西可画"，
+        // 标签就永远停在第一次变宽的那个数字上。实测：拖出 600x400 的框，标签显示
+        // "120 x 80"（那是字符数刚变成 8 的那一帧），后续几十帧全没重画。
+        if (next.labelValid && std::strncmp(g_prev.text, next.text, sizeof(next.text)) != 0)
+            extra = RUnion(extra, next.label);
+        n = BuildDirtyBands(g_prev, next, extra, bands, kBandCap);
+        if (n <= 0) { g_prev = std::move(next); return; }
     }
 
     for (int i = 0; i < n; ++i) {
         RestoreFromDim(bands[i]);
         PaintHole(bands[i], next);
+        PaintAnnos(bands[i], next);     // 必须在 PaintHole 之后：否则被干净像素整块盖掉
         PaintBorder(bands[i], next);
         PaintHandles(bands[i], next);   // 必须在 PaintHole 之后：把手有一半在洞内
         PaintLabel(bands[i], next);
         PushBand(bands[i], firstFrame || g_renderFull);
     }
-    g_prev = next;
+    g_prev = std::move(next);
     g_prevValid = true;
 }
 
@@ -762,23 +1024,70 @@ static void Redraw() {
 //      和"多一条 band 吃掉 kBandCap 预算"两个坑。
 // 所以：独立 WS_POPUP + WS_EX_TOPMOST 压在遮罩之上；点击不抢焦点
 // （WM_MOUSEACTIVATE 返回 MA_NOACTIVATE），否则遮罩收不到 ESC。
-// 三个按钮：1=保存（ESC 同义，主按钮）2=识别文字 3=关闭
-constexpr int kTbBtnW = 68, kTbBtnH = 28, kTbGap = 8;
-constexpr int kTbW = kTbGap * 4 + kTbBtnW * 3, kTbH = 40;
-enum { kTbSave = 1, kTbOcr = 2, kTbClose = 3 };
+// 两行、8 类按钮：
+//   第一行  1=矩形 2=椭圆 3=箭头 4=画笔 │ 5=撤销 │ 6=保存 7=识别文字 8=关闭
+//   第二行  20..25=颜色（红/黄/蓝/绿/黑/白）        30..33=粗细（2/4/6/9）
+// 第一行宽度：8 + 4×44 + 3×8 + 16 + 44 + 16 + 3×68 + 2×8 + 8 = 512
+constexpr int kTbToolW = 44;    // 工具按钮（放两个汉字）
+constexpr int kTbBtnW  = 68;    // 文字按钮
+constexpr int kTbBtnH  = 28;
+constexpr int kTbGap   = 8;
+constexpr int kTbPad   = 8;
+constexpr int kTbSep   = 16;    // 分组之间的分隔缝
+constexpr int kTbRowH  = 32;    // 第二行（颜色 / 粗细）高度
+constexpr int kTbSwW   = 22, kTbSwPitch = 30;   // 色块边长 / 步距（间距 8）
+constexpr int kTbWdX0  = kTbPad + 6 * kTbSwPitch + 14;   // 粗细组起点 = 202
+constexpr int kTbW = kTbPad + kTbToolW * 4 + kTbGap * 3 + kTbSep + kTbToolW + kTbSep
+                   + kTbBtnW * 3 + kTbGap * 2 + kTbPad;          // = 512
+constexpr int kTbH = 40 + kTbRowH;                               // = 72
+enum {
+    kTbRect = 1, kTbEllipse, kTbArrow, kTbPen, kTbUndo, kTbSave, kTbOcr, kTbClose,
+    kTbColor0 = 20, kTbColor5 = 25,
+    kTbWidth0 = 30, kTbWidth3 = 33,
+};
 static HWND g_tb = nullptr;
 static int  g_tbHot = 0;    // 悬停的按钮
 static int  g_tbPress = 0;  // 已按下尚未松开的按钮
 static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l);  // TbCreate 需要
 
 static RECT TbButtonRect(int id) {
-    int x = kTbGap + (id - 1) * (kTbBtnW + kTbGap);
-    int y = (kTbH - kTbBtnH) / 2;
-    return { x, y, x + kTbBtnW, y + kTbBtnH };
+    const int y1 = (40 - kTbBtnH) / 2;
+    if (id >= kTbRect && id <= kTbPen) {
+        const int x = kTbPad + (id - kTbRect) * (kTbToolW + kTbGap);
+        return { x, y1, x + kTbToolW, y1 + kTbBtnH };
+    }
+    if (id == kTbUndo) {
+        const int x = kTbPad + kTbToolW * 4 + kTbGap * 3 + kTbSep;
+        return { x, y1, x + kTbToolW, y1 + kTbBtnH };
+    }
+    if (id >= kTbSave && id <= kTbClose) {
+        const int x0 = kTbPad + kTbToolW * 4 + kTbGap * 3 + kTbSep + kTbToolW + kTbSep;
+        const int x = x0 + (id - kTbSave) * (kTbBtnW + kTbGap);
+        return { x, y1, x + kTbBtnW, y1 + kTbBtnH };
+    }
+    if (id >= kTbColor0 && id <= kTbColor5) {
+        const int y = 40 + (kTbRowH - kTbSwW) / 2;
+        const int x = kTbPad + (id - kTbColor0) * kTbSwPitch;
+        return { x, y, x + kTbSwW, y + kTbSwW };
+    }
+    if (id >= kTbWidth0 && id <= kTbWidth3) {
+        const int y = 40 + (kTbRowH - kTbSwW) / 2;
+        const int x = kTbWdX0 + (id - kTbWidth0) * kTbSwPitch;
+        return { x, y, x + kTbSwW, y + kTbSwW };
+    }
+    return { 0, 0, 0, 0 };
 }
 static int TbHitTest(POINT pt) {
     // 不能对 TbButtonRect 的临时返回值取地址（C2102），先落到局部变量
-    for (int id = kTbSave; id <= kTbClose; ++id) {
+    for (int id = kTbRect; id <= kTbClose; ++id) {
+        RECT r = TbButtonRect(id);
+        if (PtInRect(&r, pt)) return id;
+    }
+    for (int id = kTbColor0; id <= kTbColor5; ++id) {
+        RECT r = TbButtonRect(id);
+        if (PtInRect(&r, pt)) return id;
+    }
+    for (int id = kTbWidth0; id <= kTbWidth3; ++id) {
         RECT r = TbButtonRect(id);
         if (PtInRect(&r, pt)) return id;
     }
@@ -787,7 +1096,8 @@ static int TbHitTest(POINT pt) {
 
 // 收尾：销毁工具栏，置退出标志。裁剪与剪贴板统一在 CaptureRegionInteractive
 // 尾部做（只裁一次，这里不重复）。
-//   action = 0 取消 / 1 只保存图片 / 2 识别文字（先图后字）
+//   action = 0 取消 / kTbSave 只保存图片 / kTbOcr 识别文字（先图后字）
+// 只有这两个 id 才是"拿到结果"，其余（工具/颜色/粗细/关闭）都不是。
 static void FinishAdjust(int action) {
     if (g_tb) { DestroyWindow(g_tb); g_tb = nullptr; }
     // 只有"保存"和"识别文字"才算拿到结果；点"关闭"等于取消
@@ -796,6 +1106,22 @@ static void FinishAdjust(int action) {
     g.ocrWanted  = (action == kTbOcr);
     g.done = true;
     if (g.w) DestroyWindow(g.w);
+}
+
+// 工具栏命令分发：工具/颜色/粗细只改状态（选区与遮罩都不动），只有 6/7/8 收尾。
+static void TbCommand(int id) {
+    if (id >= kTbRect && id <= kTbPen) {
+        const int t = AT_RECT + (id - kTbRect);
+        g.annTool = (g.annTool == t) ? AT_NONE : t;   // 再点一次同一个工具 = 退出标注模式
+        return;
+    }
+    if (id == kTbUndo) {
+        if (!g.annos.empty()) { g.annos.pop_back(); Redraw(); }
+        return;
+    }
+    if (id >= kTbColor0 && id <= kTbColor5) { g.annColor = id - kTbColor0; return; }
+    if (id >= kTbWidth0 && id <= kTbWidth3) { g.annWidthIdx = id - kTbWidth0; return; }
+    FinishAdjust(id);
 }
 
 // 工具栏跟随选区：优先贴在选区正下方居中，下方放不下改上方，再钳回工作区。
@@ -854,32 +1180,93 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             DeleteObject(bg);
             HPEN pen = CreatePen(PS_SOLID, 1, RGB(210, 214, 220));
             HGDIOBJ op = SelectObject(mem, pen);
+            HGDIOBJ obr = SelectObject(mem, GetStockObject(NULL_BRUSH));
             Rectangle(mem, 0, 0, kTbW, kTbH);
+            SelectObject(mem, obr);
             SelectObject(mem, op);
             DeleteObject(pen);
+
+            // 行分隔 + 分组竖线：8 个工具按钮挤在一起时，靠这几条线才看得出分组
+            HBRUSH sepB = CreateSolidBrush(RGB(228, 231, 236));
+            RECT hline{ kTbPad, 40, kTbW - kTbPad, 41 };
+            FillRect(mem, &hline, sepB);
+            {
+                RECT u = TbButtonRect(kTbUndo);
+                RECT sv = TbButtonRect(kTbSave);
+                RECT v1{ u.left - kTbSep / 2, 8, u.left - kTbSep / 2 + 1, 32 };
+                RECT v2{ sv.left - kTbSep / 2, 8, sv.left - kTbSep / 2 + 1, 32 };
+                FillRect(mem, &v1, sepB);
+                FillRect(mem, &v2, sepB);
+            }
+            DeleteObject(sepB);
+
             HFONT f = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                   CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                   DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
             HGDIOBJ of = SelectObject(mem, f);
             SetBkMode(mem, TRANSPARENT);
-            static const wchar_t* kLabel[4] = { L"", L"保存", L"识别文字", L"关闭" };
-            for (int id = kTbSave; id <= kTbClose; ++id) {
+            static const wchar_t* kLabel[9] = {
+                L"", L"矩形", L"椭圆", L"箭头", L"画笔", L"撤销", L"保存", L"识别文字", L"关闭"
+            };
+            for (int id = kTbRect; id <= kTbClose; ++id) {
                 RECT r = TbButtonRect(id);
-                bool on = (g_tbPress == id) || (g_tbPress == 0 && g_tbHot == id);
-                const bool primary = (id == kTbSave);
-                COLORREF fill = primary
-                    ? (on ? RGB(0, 95, 180) : RGB(0, 120, 215))
-                    : (on ? RGB(225, 228, 232) : RGB(240, 242, 245));
+                const bool on  = (g_tbPress == id) || (g_tbPress == 0 && g_tbHot == id);
+                const bool pri = (id == kTbSave);
+                bool active = false;
+                if (id <= kTbPen)          active = (g.annTool == AT_RECT + (id - kTbRect));
+                const bool emptyUndo = (id == kTbUndo && g.annos.empty());
+                COLORREF fill, txt;
+                if (pri)         { fill = on ? RGB(0, 95, 180) : RGB(0, 120, 215); txt = RGB(255, 255, 255); }
+                else if (active) { fill = RGB(0, 120, 215); txt = RGB(255, 255, 255); }
+                else             { fill = on ? RGB(225, 228, 232) : RGB(240, 242, 245); txt = RGB(60, 60, 60); }
+                if (emptyUndo) txt = RGB(170, 174, 180);   // 没东西可撤销：灰掉
                 HBRUSH bb = CreateSolidBrush(fill);
                 FillRect(mem, &r, bb);
                 DeleteObject(bb);
-                SetTextColor(mem, primary ? RGB(255, 255, 255) : RGB(60, 60, 60));
+                SetTextColor(mem, txt);
                 DrawTextW(mem, kLabel[id], -1, &r,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
             SelectObject(mem, of);
             DeleteObject(f);
+
+            // 第二行左：颜色色块（白/黄在白底上要靠描边才看得见，选中态用 2px 蓝框）
+            for (int id = kTbColor0; id <= kTbColor5; ++id) {
+                RECT r = TbButtonRect(id);
+                const int ci = id - kTbColor0;
+                const bool sel = (g.annColor == ci);
+                HBRUSH bb = CreateSolidBrush(RGB(kAnnColors[ci][0], kAnnColors[ci][1], kAnnColors[ci][2]));
+                FillRect(mem, &r, bb);
+                DeleteObject(bb);
+                HPEN p2 = CreatePen(PS_SOLID, sel ? 2 : 1,
+                                    sel ? RGB(0, 120, 215) : RGB(205, 208, 214));
+                HGDIOBJ op2 = SelectObject(mem, p2);
+                HGDIOBJ ob2 = SelectObject(mem, GetStockObject(NULL_BRUSH));
+                Rectangle(mem, r.left, r.top, r.right, r.bottom);
+                SelectObject(mem, ob2);
+                SelectObject(mem, op2);
+                DeleteObject(p2);
+            }
+            // 第二行右：粗细（画一条等厚示范线；用灰/白而不是当前颜色，
+            // 否则选了白色时这条线在白底按钮上根本看不见）
+            for (int id = kTbWidth0; id <= kTbWidth3; ++id) {
+                RECT r = TbButtonRect(id);
+                const int wi = id - kTbWidth0;
+                const bool sel = (g.annWidthIdx == wi);
+                const bool on = (g_tbPress == id) || (g_tbPress == 0 && g_tbHot == id);
+                HBRUSH bb = CreateSolidBrush(sel ? RGB(0, 120, 215)
+                                                 : (on ? RGB(225, 228, 232) : RGB(240, 242, 245)));
+                FillRect(mem, &r, bb);
+                DeleteObject(bb);
+                const int t = kAnnWidths[wi];
+                const int cy = (r.top + r.bottom) / 2;
+                RECT lr{ r.left + 5, cy - t / 2, r.right - 5, cy - t / 2 + t };
+                HBRUSH lb = CreateSolidBrush(sel ? RGB(255, 255, 255) : RGB(70, 70, 70));
+                FillRect(mem, &lr, lb);
+                DeleteObject(lb);
+            }
+
             BitBlt(dc, 0, 0, kTbW, kTbH, mem, 0, 0, SRCCOPY);
             SelectObject(mem, ob);
             DeleteObject(mb);
@@ -907,7 +1294,11 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_tbPress = 0;
             ReleaseCapture();
             InvalidateRect(h, NULL, FALSE);
-            if (press != 0 && press == hit) FinishAdjust(press);   // 1保存 / 2识别文字 / 3关闭
+            if (press != 0 && press == hit) {
+                TbCommand(press);
+                // 选工具/颜色/粗细后要刷新按钮状态；收尾路径已经把 g_tb 销毁了
+                if (g_tb) InvalidateRect(g_tb, NULL, FALSE);
+            }
             return 0;
         }
         case WM_MOUSEACTIVATE:
@@ -924,10 +1315,23 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             p.x = GET_X_LPARAM(l) + g.vx;
             p.y = GET_Y_LPARAM(l) + g.vy;
             if (g.phase == Phase::Adjust) {
-                // 调整态：命中把手则开始拖把手；点在选区里什么都不做
-                // （避免误触把刚调好的选区清掉）
+                // 调整态：命中把手则开始拖把手（把手优先 —— 点在选区边上就是微调，
+                // 不该变成落笔）；点在选区内且选了工具才开始画标注；
+                // 其余位置什么都不做（避免误触把刚调好的选区清掉）
                 int i = HitHandle(p);
-                if (i >= 0) { g.dragHandle = i; SetCapture(h); Redraw(); }
+                if (i >= 0) { g.dragHandle = i; SetCapture(h); Redraw(); break; }
+                if (g.annTool != AT_NONE && PtInRect(&g.sel, p)) {
+                    g.drawingAnn = true;
+                    g.annCur = Anno{};
+                    g.annCur.tool = g.annTool;
+                    g.annCur.color = g.annColor;
+                    g.annCur.widthIdx = g.annWidthIdx;
+                    g.annCur.pts.push_back(p);
+                    // 两点型（矩形/椭圆/箭头）先放两个相同的点，移动时只改第二个
+                    if (g.annTool != AT_PEN) g.annCur.pts.push_back(p);
+                    SetCapture(h);
+                    Redraw();
+                }
                 break;
             }
             // 起点也吸附：从窗口角/边上起拖，整框才会跟着窗口对齐（微信同款）。
@@ -942,6 +1346,25 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             p.x = GET_X_LPARAM(l) + g.vx;
             p.y = GET_Y_LPARAM(l) + g.vy;
             g.cur = p;
+            if (g.phase == Phase::Adjust && g.drawingAnn) {
+                // 钳在选区内：墨迹只在洞里可见，也只会被存进最终截图
+                POINT q = p;
+                if (q.x < g.sel.left)             q.x = g.sel.left;
+                if (q.x > g.sel.right - 1)        q.x = g.sel.right - 1;
+                if (q.y < g.sel.top)              q.y = g.sel.top;
+                if (q.y > g.sel.bottom - 1)       q.y = g.sel.bottom - 1;
+                if (g.annCur.tool == AT_PEN) {
+                    const POINT back = g.annCur.pts.back();
+                    // 曼哈顿距离 ≥2 才收点：鼠标不动时 message 仍在刷，不去重会长出
+                    // 上万个重复点（每帧都要全量比较 + 全量重画）
+                    if (std::abs(q.x - back.x) + std::abs(q.y - back.y) >= 2)
+                        g.annCur.pts.push_back(q);
+                } else if (g.annCur.pts.size() >= 2) {
+                    g.annCur.pts[1] = q;
+                }
+                Redraw();
+                break;
+            }
             if (g.phase == Phase::Adjust && g.dragHandle >= 0) {
                 ApplyHandleDrag(p);
                 TbReposition();
@@ -957,6 +1380,26 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_LBUTTONUP:
             if (g.phase == Phase::Adjust) {
+                if (g.drawingAnn) {
+                    g.drawingAnn = false;
+                    ReleaseCapture();
+                    // 外接框两边都 < 3px 的一笔当误点丢掉（手抖、点了没拖）
+                    int l = 0, t = 0, r = 0, b = 0;
+                    if (!g.annCur.pts.empty()) {
+                        l = r = g.annCur.pts[0].x;
+                        t = b = g.annCur.pts[0].y;
+                        for (size_t k = 1; k < g.annCur.pts.size(); ++k) {
+                            l = std::min(l, (int)g.annCur.pts[k].x);
+                            r = std::max(r, (int)g.annCur.pts[k].x);
+                            t = std::min(t, (int)g.annCur.pts[k].y);
+                            b = std::max(b, (int)g.annCur.pts[k].y);
+                        }
+                    }
+                    if (!(r - l < 3 && b - t < 3)) g.annos.push_back(g.annCur);
+                    g.annCur = Anno{};
+                    Redraw();
+                    break;
+                }
                 if (g.dragHandle >= 0) { g.dragHandle = -1; ReleaseCapture(); Redraw(); }
                 break;
             }
@@ -993,6 +1436,11 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 break;
             }
             if (w == VK_RETURN && g.phase == Phase::Adjust) { FinishAdjust(kTbSave); break; }
+            // Ctrl+Z 撤销最后一笔标注（只在调整态有意义）
+            if (g.phase == Phase::Adjust && w == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (!g.annos.empty()) { g.annos.pop_back(); Redraw(); }
+                break;
+            }
             // 方向键微调：1px，按住 Shift 10px。吸附完还差一两个像素时不用再抖鼠标。
             {
                 const int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
@@ -1229,6 +1677,21 @@ CaptureImage CaptureRegionInteractive() {
             dstRow[x * 3 + 1] = src[1]; // G
             dstRow[x * 3 + 2] = src[0]; // B
         }
+    }
+
+    // 把标注合成进最终图片。用的是与遮罩层完全相同的光栅化函数（Surf 只换了 bpp
+    // 和字节序），所以预览与成品逐像素一致 —— 不会出现"预览 4px、保存出来 3px"。
+    // 图像坐标 = 绝对屏幕坐标 − 选区左上角；画到选区外的那部分本来就被裁掉了。
+    if (!g.annos.empty()) {
+        Surf su;
+        su.px = out.rgb.data();
+        su.stride = rw * 3;
+        su.bpp = 3;
+        su.bgr = false;                 // CaptureImage.rgb 是 RGB 顺序，不是 BGRA
+        su.w = rw; su.h = rh;
+        su.ox = s.left; su.oy = s.top;
+        su.clip = RECT{ s.left, s.top, s.left + rw, s.top + rh };
+        for (size_t i = 0; i < g.annos.size(); ++i) PaintAnno(su, g.annos[i]);
     }
 
     // 调整态退出：裁剪只在这里做一次，然后按"保存"还是"识别文字"分流。
