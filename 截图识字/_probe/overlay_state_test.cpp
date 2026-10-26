@@ -25,6 +25,11 @@
 const wchar_t* ShotIniPath() { return L""; }              // main.cpp 提供
 bool CopyImageToClipboard(const CaptureImage&) { return false; }   // view.cpp 提供
 bool ShotOcrAndCopy(const CaptureImage&) { return false; }         // view.cpp 提供
+// 文字拾取那轮新增的外部符号：本测试不跑 OCR 路径，空实现满足链接即可。
+bool ShotCopyImageThenText(const CaptureImage&, const std::string&) { return false; }
+bool OcrEnsureEngine() { return false; }
+std::vector<OcrWord> OcrImage(const CaptureImage&) { return {}; }
+std::string FormatSelection(const std::vector<OcrWord>&, NewlineMode) { return {}; }
 
 #include <cstdio>
 #include <random>

@@ -15,6 +15,10 @@
 const wchar_t* ShotIniPath() { return L""; }
 bool CopyImageToClipboard(const CaptureImage&) { return true; }
 bool ShotOcrAndCopy(const CaptureImage&) { return false; }
+bool ShotCopyImageThenText(const CaptureImage&, const std::string&) { return false; }
+bool OcrEnsureEngine() { return false; }
+std::vector<OcrWord> OcrImage(const CaptureImage&) { return {}; }
+std::string FormatSelection(const std::vector<OcrWord>&, NewlineMode) { return {}; }
 
 #include <cstdio>
 

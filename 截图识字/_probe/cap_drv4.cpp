@@ -82,12 +82,26 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
     Sleep(120);
 }
 
-// 工具栏按钮中心（客户区坐标），见文件头布局表
+// 工具栏（单行 40 高，纯图标）。按钮中心（客户区坐标）：
+//   行 y 中心恒为 20
+//   工具 1..5 中心 x = 24 / 58 / 92 / 126 / 160（矩形 椭圆 箭头 画笔 文）
+//   保存(下载图标) 6 中心 x = 204
+//   颜色 20..25 中心 x = 247+26i
+//   粗细 30..33 中心 x = 416+26i
 static POINT TbCenter(int id) {
-    if (id >= 20 && id <= 25) return POINT{ 20 + 30 * (id - 20), 56 };   // 颜色
-    if (id >= 30 && id <= 33) return POINT{ 214 + 30 * (id - 30), 56 };  // 粗细
-    static const int cx[9] = { 0, 30, 82, 134, 186, 246, 318, 394, 470 };
+    if (id >= 20 && id <= 25) return POINT{ 247 + 26 * (id - 20), 20 };
+    if (id >= 30 && id <= 33) return POINT{ 416 + 26 * (id - 30), 20 };
+    static const int cx[9] = { 0, 24, 58, 92, 126, 160, 204, 0, 0 };
     return POINT{ cx[id], 20 };
+}
+
+// 真按键：Ctrl+Z。GetKeyState 读的是线程输入状态，只能靠 keybd_event 影响。
+static void UndoCtrlZ() {
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event('Z', 0, 0, 0);
+    keybd_event('Z', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    Sleep(250);
 }
 
 static void ClickTb(HWND tb, int id) {
@@ -95,7 +109,7 @@ static void ClickTb(HWND tb, int id) {
     SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(p.x, p.y));
     SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(p.x, p.y));
     SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(p.x, p.y));
-    Sleep(160);
+    Sleep(180);
 }
 
 // ---- 剪贴板 DIB：24bpp bottom-up，行 4 字节对齐 ----
@@ -187,8 +201,11 @@ int main() {
             Check(tb != nullptr, "S1 工具栏出现");
             if (tb) {
                 RECT tr; GetWindowRect(tb, &tr);
-                printf("[drv4]      工具栏 %ldx%ld（期望 512x72）\n",
+                // 单行图标工具栏定案尺寸 512x40（两行布局时代是 512x72）。
+                printf("[drv4]      工具栏 %ldx%ld（期望 512x40）\n",
                        tr.right - tr.left, tr.bottom - tr.top);
+                Check(tr.right - tr.left == 512 && tr.bottom - tr.top == 40,
+                      "S1 工具栏是单行 512x40");
 
                 ClickTb(tb, TB_RECT);
                 Check(FindByClass(kMaskClass, g_pid) != nullptr,
@@ -234,7 +251,9 @@ int main() {
             if (tb) {
                 ClickTb(tb, TB_RECT);
                 DragTo(mask, g_vx + 300, g_vy + 300, g_vx + 500, g_vy + 450, 16);
-                ClickTb(tb, TB_UNDO);
+                // 工具栏上已经没有撤销按钮（用户定案：Ctrl+Z），必须发真按键：
+                // 产品的撤销判断读的是 GetKeyState(VK_CONTROL)，PostMessage 伪造不了。
+                UndoCtrlZ();
                 Check(FindByClass(kMaskClass, g_pid) != nullptr, "S2 撤销后遮罩仍在");
                 ClickTb(tb, TB_SAVE);
                 Sleep(400);
