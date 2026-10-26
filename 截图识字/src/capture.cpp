@@ -380,7 +380,7 @@ static bool SameAnnos(const std::vector<Anno>& a, const std::vector<Anno>& b) {
 }
 static bool SameOverlay(const OverlayState& a, const OverlayState& b) {
     if (a.drag != b.drag || a.labelValid != b.labelValid) return false;
-    // 进入/离开调整态会整体出现或消失八个把手，且 footprint 也会变（外扩 kHandleH）
+    // 进入/离开调整态会整体出现或消失八个把手，且 footprint 也会变（按真实把手矩形求并）
     if (a.adjust != b.adjust) return false;
     if (a.hole.left != b.hole.left || a.hole.top != b.hole.top ||
         a.hole.right != b.hole.right || a.hole.bottom != b.hole.bottom) return false;
@@ -571,7 +571,8 @@ static void PaintLabel(const RECT& band, const OverlayState& s) {
 // 编号：0=左上 1=上中 2=右上 3=右中 4=右下 5=下中 6=左下 7=左中
 constexpr int kHandleSize = 8;      // 角把手边长（8x8）
 constexpr int kEdgeHandleLen = 24;   // 边中点把手沿边方向的长度
-constexpr int kHandleH = 8;         // 脏区 footprint 的外扩量（必须 ≥ 把手半边长 4）
+// 注：不再有 kHandleH。足迹改成按真实把手矩形求并（见 HoleFootprint），
+// 常数外扩在"选区比边中点把手还窄"时会漏掉甩出去的那几列像素。
 
 // 入参与输出同一坐标系：绘制时传窗口坐标的 hole，命中测试时传虚拟屏坐标的 g.sel。
 static void BuildHandleRects(const RECT& sel, RECT out[8]) {
@@ -819,15 +820,23 @@ static void PaintAnnos(const RECT& band, const OverlayState& s) {
     if (s.drawingAnn) PaintAnno(su, s.annCur);   // 正在画的那一条也画，所见即所得
 }
 
-// 洞的「绘制足迹」：调整态要外扩 kHandleH，因为八个把手是跨洞边界画的，
-// 有一半在洞外。用**一个**外扩矩形表达（而不是 4 条 ring 带）是为了让
-// StateRegion 恒为「1 个洞矩形 + 1 个标签矩形」：脏区是前后两个状态的 XOR，
+// 用**一个**矩形表达（而不是 4 条 ring 带）是为了让 StateRegion 恒为
+// 「1 个洞矩形 + 1 个标签矩形」：脏区是前后两个状态的 XOR，
 // footprint 的 rect 数越少，XOR 出来的 rect 就越少，越不会因为超过 kBandCap
 // 而走溢出合并。覆盖性由构造保证：角把手 x∈[left-4,left+4] ⊂ [left-8,right+8]。
+// 洞的「绘制足迹」：调整态必须把八个把手整个罩住，因为它们是跨洞边界画的。
+//
+// 这里曾经写成"洞统一外扩 kHandleH=8"，前提是"把手最远只伸到 ±4"。那个前提是错的：
+// 边中点把手沿边方向长 kEdgeHandleLen=24，选区一旦比 24 窄，它就会**横向甩出洞外**
+// 超过 8px。实测（选区 4px 宽）：上中把手是 (329,48)-(353,56)，而按 8px 外扩得到的
+// 足迹右边界只有 351 —— 那 2 列白块/蓝边永远进不了脏区，拖动时留在屏幕上。
+// 所以按**真实把手矩形**求并，不再拍常数。仍是 1 个矩形，脏区复杂度不变。
 static RECT HoleFootprint(const OverlayState& s) {
     if (!s.adjust) return s.hole;
-    RECT r = { s.hole.left - kHandleH, s.hole.top - kHandleH,
-               s.hole.right + kHandleH, s.hole.bottom + kHandleH };
+    RECT hs[8];
+    BuildHandleRects(s.hole, hs);
+    RECT r = s.hole;
+    for (int i = 0; i < 8; ++i) r = RUnion(r, hs[i]);
     return RIntersect(r, RECT{ 0, 0, g.vw, g.vh });
 }
 
@@ -870,7 +879,7 @@ static double BandCost(int n, long long area) {
 }
 
 static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
-                           const RECT& extra, RECT out[], int cap) {
+                           const std::vector<RECT>& extra, RECT out[], int cap) {
     HRGN ra = StateRegion(a);
     HRGN rb = StateRegion(b);
     HRGN d = CreateRectRgn(0, 0, 0, 0);
@@ -913,7 +922,7 @@ static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
     // 里，XOR 也是空 → 屏幕上的旧框永远留着。所以调用方把 RUnion(旧框, 新框) 传进来。
     // 代价是这一帧按外接框面积而不是按"线"来重画，一个占满选区的大标注拖动时约
     // 2~5ms/帧 —— 只在拖标注的那几十帧里出现，可以接受。
-    if (!REmpty(extra)) v.push_back(extra);
+    for (const RECT& x : extra) if (!REmpty(x)) v.push_back(x);
 
     if (v.empty()) return 0;
 
@@ -975,6 +984,57 @@ static void PushBand(const RECT& band, bool full) {
     pULWI(g.w, &info);
 }
 
+// 「必须重画」的兜底矩形集合：区域异或只看得见"区域不同"，看不见"同一区域里
+// 像素不同"。三类漏点共用这一味药，三类都是实测拿到的，不是假想：
+//
+//   ① 标注：矩形从大拖小，旧外框的像素全落在"新旧外接框的交集"里，异或选不出来
+//      → 屏幕上的旧框永远留着。
+//   ② 标签：尺寸数字变了但字宽不变（"120 x 80" 之后全是 3 位数）时标签矩形一字
+//      不差 → 异或为空 → 整帧被判成"没东西可画"，标签停在第一次变宽的数字上。
+//      实测：拖出 600x400 的框，标签显示 "120 x 80"。
+//   ③ 洞/边框/把手：**边框是画在洞内部的**。洞一移动，新边框就落进旧洞里（区域
+//      交集），旧的边框又在旧洞边缘；调整态下八个把手还整个跟着走。区域异或只能
+//      选中"一侧有一侧没有"的像素，交集里那些"内容变了但归属没变"的像素永远进不了
+//      脏区。实测（overlay_state_test 第 3 节，1500 例）：只补 ① ② 时仍漏 3435 像素。
+//
+// 补法必须按类分开，不能用一个外接框糊住：整洞重画在 1080p 约 6ms/帧，而按"边框环"
+// 补只有周长×2 的面积，成本可忽略。这也是为什么返回的是**一组**矩形而不是一个。
+//
+// 正确性依据：painter 是状态的纯函数，像素差异只可能落在「旧状态画过的像素 ∪
+// 新状态画过的像素」之内；各类的足迹分别是 annBox / label / 洞(含边框、含把手)。
+static void PushRing(std::vector<RECT>& out, const RECT& h) {
+    const int w = 2;                       // 与 PaintBorder 的线宽一致
+    if (REmpty(h)) return;
+    out.push_back(RECT{ h.left, h.top, h.right, h.top + w });
+    out.push_back(RECT{ h.left, h.bottom - w, h.right, h.bottom });
+    out.push_back(RECT{ h.left, h.top, h.left + w, h.bottom });
+    out.push_back(RECT{ h.right - w, h.top, h.right, h.bottom });
+}
+
+static std::vector<RECT> DirtyExtra(const OverlayState& a, const OverlayState& b) {
+    std::vector<RECT> v;
+    // ① 标注：并集一个矩形就够（墨迹 ⊆ annBox ⊆ 洞）
+    v.push_back(RUnion(a.annBox, b.annBox));
+    // ② 标签：只有"矩形没动但文字变了"才需要（矩形动了异或自己会选中）
+    if (b.labelValid && std::strncmp(a.text, b.text, sizeof(b.text)) != 0)
+        v.push_back(b.label);
+    // ③ 洞几何变化
+    const bool holeMoved = a.hole.left != b.hole.left || a.hole.top != b.hole.top ||
+                           a.hole.right != b.hole.right || a.hole.bottom != b.hole.bottom;
+    if (holeMoved) {
+        // 调整态：足迹整体补（洞 + 边框 + 八个把手），一个矩形罩住，此时不必再补环
+        if (a.adjust) v.push_back(HoleFootprint(a));
+        if (b.adjust) v.push_back(HoleFootprint(b));
+        // 非调整态：只补边框环。洞内部像素只依赖绝对坐标，交集里内容相同，不用重画。
+        if (!a.adjust) PushRing(v, a.hole);
+        if (!b.adjust) PushRing(v, b.hole);
+    }
+    std::vector<RECT> out;
+    out.reserve(v.size());
+    for (const RECT& r : v) if (!REmpty(r)) out.push_back(r);
+    return out;
+}
+
 static void Redraw() {
     if (g.dim.empty() || !g.w || !g.bits) return;
 
@@ -991,15 +1051,8 @@ static void Redraw() {
         bands[0] = RECT{ 0, 0, g.vw, g.vh };
         n = 1;
     } else {
-        // 标注的前后足迹并集：内容变了（新增/撤销/正在画）时区域异或选不出脏区，
-        // 必须靠它兜底，理由见 BuildDirtyBands 里那段注释。
-        RECT extra = RUnion(g_prev.annBox, next.annBox);
-        // 同一类漏点，标签也有：尺寸数字变了但标签矩形一字不差时（"120 x 80" 之后
-        // 全是 3 位数，字宽不变 → 矩形不变），异或为空 → 这帧被判成"没东西可画"，
-        // 标签就永远停在第一次变宽的那个数字上。实测：拖出 600x400 的框，标签显示
-        // "120 x 80"（那是字符数刚变成 8 的那一帧），后续几十帧全没重画。
-        if (next.labelValid && std::strncmp(g_prev.text, next.text, sizeof(next.text)) != 0)
-            extra = RUnion(extra, next.label);
+        // 标注/标签/边框/把手的"内容变了但区域没变"必须靠 extra 兜底，理由见 DirtyExtra。
+        std::vector<RECT> extra = DirtyExtra(g_prev, next);
         n = BuildDirtyBands(g_prev, next, extra, bands, kBandCap);
         if (n <= 0) { g_prev = std::move(next); return; }
     }

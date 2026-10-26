@@ -65,11 +65,22 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
     Sleep(180);
 }
 
+// 工具栏按钮中心（客户区坐标）。两行布局：
+//   行1 y=6..34（中心 20）：矩形30 椭圆82 箭头134 画笔186 撤销246 保存318 识别394 关闭470
+//   行2 y=44..68（中心 56）：颜色 i → 20+30i；粗细 i → 214+30i
+static POINT TbCenter(int id) {
+    if (id >= 20 && id <= 25) return POINT{ 20 + 30 * (id - 20), 56 };
+    if (id >= 30 && id <= 33) return POINT{ 214 + 30 * (id - 30), 56 };
+    static const int cx[9] = { 0, 30, 82, 134, 186, 246, 318, 394, 470 };
+    return POINT{ cx[id], 20 };
+}
+
 static void ClickTb(HWND tb, int id) {
-    int cx = 8 + (id - 1) * 76 + 34, cy = 20;   // 见 capture.cpp TbButtonRect
-    SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(cx, cy));
-    SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
-    SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
+    POINT p = TbCenter(id);
+    SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(p.x, p.y));
+    SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(p.x, p.y));
+    SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(p.x, p.y));
+    Sleep(160);
 }
 
 // 取剪贴板里的 unicode 文本（调用方负责判断格式是否存在）
@@ -191,7 +202,7 @@ int main() {
     Check(tb != nullptr, "工具栏出现（进入调整态）");
     if (!tb) { DestroyWindow(tw); return 1; }
 
-    ClickTb(tb, 2);                 // 2 = 识别文字
+    ClickTb(tb, 7);                 // 7 = 识别文字
     Pump(9000);                     // 等 OCR：懒加载 + 识别
 
     Check(FindByClass(kMaskClass, pid) == nullptr, "识别完遮罩已销毁");

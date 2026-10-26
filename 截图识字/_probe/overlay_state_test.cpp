@@ -58,13 +58,17 @@ HDC MakeDib(int w, int h, void** bits, HBITMAP* outBmp) {
 }
 
 // 按当前 Redraw 的 per-band 次序渲染一个完整状态（band = 整屏）
+// 顺序必须与 Redraw 一致：RestoreFromDim → PaintHole → PaintAnnos → PaintBorder
+// → PaintHandles → PaintLabel。少画一层，测试对这个维度就是瞎的。
 void Render(const OverlayState& s, void* bits, HDC dc) {
     g.bits = bits;
     g.hDc = dc;
     const RECT full{0, 0, VW, VH};
     RestoreFromDim(full);
     PaintHole(full, s);
+    PaintAnnos(full, s);
     PaintBorder(full, s);
+    PaintHandles(full, s);
     PaintLabel(full, s);
 }
 
@@ -90,10 +94,43 @@ RECT RandRect() {
 
 const char* kTexts[] = {"300 x 200", "301 x 200", "1 x 1", "1024 x 768", "99 x 99"};
 
+// 标注：窗口坐标下随便画一条（坐标系在测试里统一按 vx=vy=0 处理）
+Anno RandAnno(const RECT& hole) {
+    Anno a;
+    a.tool = rng.in(AT_RECT, AT_PEN);
+    a.color = rng.in(0, 5);
+    a.widthIdx = rng.in(0, 3);
+    int x0 = rng.in(hole.left, hole.right > hole.left ? hole.right : hole.left + 1);
+    int y0 = rng.in(hole.top, hole.bottom > hole.top ? hole.bottom : hole.top + 1);
+    int x1 = rng.in(hole.left, hole.right > hole.left ? hole.right : hole.left + 1);
+    int y1 = rng.in(hole.top, hole.bottom > hole.top ? hole.bottom : hole.top + 1);
+    a.pts.push_back(POINT{x0, y0});
+    if (a.tool == AT_PEN) {
+        int n = rng.in(1, 4);
+        for (int i = 0; i < n; ++i)
+            a.pts.push_back(POINT{rng.in(hole.left, hole.right > hole.left ? hole.right : hole.left + 1),
+                                  rng.in(hole.top, hole.bottom > hole.top ? hole.bottom : hole.top + 1)});
+    } else {
+        a.pts.push_back(POINT{x1, y1});
+    }
+    return a;
+}
+
+// 与 BuildOverlayState 用**同一个** GrowAnnoBox，不在这里抄一遍：
+// 抄一遍就等于"用我自己对足迹的理解去验收产品"，箭头两翼那种外扩一旦抄漏，
+// 测试会在恰好该抓到的地方变绿。
+void FillAnnBox(OverlayState& s) {
+    RECT ab{ 0, 0, 0, 0 };
+    for (const Anno& a : s.annos) GrowAnnoBox(ab, a);
+    if (s.drawingAnn) GrowAnnoBox(ab, s.annCur);
+    s.annBox = REmpty(ab) ? RECT{0, 0, 0, 0} : RIntersect(ab, s.hole);
+}
+
 OverlayState RandState() {
     OverlayState s;
     s.hole = RandRect();
     s.drag = (rng.in(0, 1) == 1);
+    s.adjust = (rng.in(0, 3) == 0);
     s.labelValid = (rng.in(0, 4) != 0);
     if (s.labelValid) {
         int lw = rng.in(20, 90), lh = 17 + 8;
@@ -104,6 +141,12 @@ OverlayState RandState() {
     }
     std::strncpy(s.text, kTexts[rng.in(0, 4)], sizeof(s.text) - 1);
     s.textW = 60; s.textH = 17;
+    // 0~3 条已完成标注，另有 1/3 概率带一条"正在画"
+    int n = rng.in(0, 3);
+    for (int i = 0; i < n; ++i) s.annos.push_back(RandAnno(s.hole));
+    s.drawingAnn = (rng.in(0, 2) == 0);
+    if (s.drawingAnn) s.annCur = RandAnno(s.hole);
+    FillAnnBox(s);
     return s;
 }
 
@@ -169,11 +212,17 @@ int main() {
             // b 有 50% 概率与 a 完全相同，50% 概率在某一个字段上做扰动
             OverlayState b = a;
             if (rng.in(0, 1)) {
-                switch (rng.in(0, 4)) {
-                    case 0: b.hole = RandRect(); break;
+                switch (rng.in(0, 6)) {
+                    case 0: b.hole = RandRect(); FillAnnBox(b); break;
                     case 1: b.drag = !b.drag; break;
                     case 2: b.labelValid = !b.labelValid; break;
                     case 3: b.label = RandRect(); break;
+                    case 4: b.adjust = !b.adjust; break;
+                    case 5:   // 加/减一条标注
+                        if (!b.annos.empty() && rng.in(0, 1)) b.annos.pop_back();
+                        else b.annos.push_back(RandAnno(b.hole));
+                        FillAnnBox(b);
+                        break;
                     default: std::strncpy(b.text, kTexts[rng.in(0, 4)], sizeof(b.text) - 1); break;
                 }
             }
@@ -195,6 +244,82 @@ int main() {
         printf("  alpha!=255 的像素总数 = %d\n", alphaBad);
         Check(eqButDiff == 0, "存在判等但像素不同的用例");
         Check(alphaBad == 0, "存在 alpha != 255 的像素（GDI 破坏 alpha 或漏了闭合修补）");
+    }
+
+    // 第 3 节：这条测的是**脏区覆盖性**，与第 2 节管的是两件不同的事。
+    //
+    // 第 2 节断言"判等 ⟺ 像素相同"，它管"该不该画"；管不了"画在哪儿"。
+    // 一个状态被判成"变了"之后，真正的 dirty rect 是 BuildDirtyBands 用两个
+    // StateRegion 异或算出来的 —— 若像素差异落在异或选不中的地方（同一区域里
+    // 内容变了），画布上就永远留着上一帧的残影。
+    //
+    // 这个缺陷在真实版本里出现过两次（都是实测抓的，不是推演）：
+    //   ① 尺寸标签：数字变了但字宽不变 → 标签矩形一字不差 → 异或为空 → 整帧跳过
+    //   ② 标注：矩形从大拖小 → 旧外框像素落在新旧框的交集里 → 异或选不出来
+    // 判据：凡是渲染结果不同的像素，必须至少落在一条 band 里。
+    printf("=== 3. 脏区覆盖性：每一处像素差异都必须被某个 band 覆盖 ===\n");
+    {
+        const int N = 1500;
+        long long diffPixels = 0, uncovered = 0;
+        int worst = 0;
+        long long perKind[5] = {0, 0, 0, 0, 0};
+        static const char* kKindName[5] = {
+            "0 改 hole（选区/把手移动）", "1 改 text（尺寸标签）",
+            "2 加一条标注", "3 正在画的标注在动", "4 撤销/删一条标注" };
+        for (int i = 0; i < N; ++i) {
+            OverlayState a = RandState();
+            OverlayState b = a;
+            // 只在"看起来会变"的维度上扰动，最接近真实交互
+            const int kind = rng.in(0, 4);
+            switch (kind) {
+                case 0: b.hole = RandRect(); FillAnnBox(b); break;
+                case 1: std::strncpy(b.text, kTexts[rng.in(0, 4)], sizeof(b.text) - 1); break;
+                case 2: b.annos.push_back(RandAnno(b.hole)); FillAnnBox(b); break;
+                case 3: b.annCur = RandAnno(b.hole); b.drawingAnn = true; FillAnnBox(b); break;
+                default: if (!b.annos.empty()) { b.annos.pop_back(); FillAnnBox(b); } break;
+            }
+            Render(a, bitsA, dcA);
+            Render(b, bitsB, dcB);
+
+            RECT bands[kBandCap];
+            const int n = BuildDirtyBands(a, b, DirtyExtra(a, b), bands, kBandCap);
+
+            const BYTE* pa = (const BYTE*)bitsA;
+            const BYTE* pb = (const BYTE*)bitsB;
+            int bad = 0;
+            for (int y = 0; y < VH; ++y) {
+                for (int x = 0; x < VW; ++x) {
+                    const size_t off = (size_t)(y * VW + x) * 4;
+                    if (std::memcmp(pa + off, pb + off, 4) == 0) continue;
+                    ++diffPixels;
+                    bool cov = false;
+                    for (int k = 0; k < n; ++k) {
+                        if (x >= bands[k].left && x < bands[k].right &&
+                            y >= bands[k].top  && y < bands[k].bottom) { cov = true; break; }
+                    }
+                    if (!cov) {
+                        ++bad; ++uncovered;
+                        if (bad <= 3)
+                            printf("      漏 (x=%d,y=%d) a=(%d,%d,%d,%d) b=(%d,%d,%d,%d) adj=%d/%d a.hole=(%ld,%ld,%ld,%ld) b.hole=(%ld,%ld,%ld,%ld) a.lab=(%ld,%ld,%ld,%ld) b.lab=(%ld,%ld,%ld,%ld) n=%d\n",
+                                   x, y,
+                                   pa[off], pa[off+1], pa[off+2], pa[off+3],
+                                   pb[off], pb[off+1], pb[off+2], pb[off+3],
+                                   (int)a.adjust, (int)b.adjust,
+                                   a.hole.left, a.hole.top, a.hole.right, a.hole.bottom,
+                                   b.hole.left, b.hole.top, b.hole.right, b.hole.bottom,
+                                   a.label.left, a.label.top, a.label.right, a.label.bottom,
+                                   b.label.left, b.label.top, b.label.right, b.label.bottom, n);
+                    }
+                }
+            }
+            perKind[kind] += bad;
+            worst = std::max(worst, bad);
+        }
+        printf("  差异像素总数 %lld，未被覆盖 %lld，单例最差 %d\n",
+               diffPixels, uncovered, worst);
+        for (int k = 0; k < 5; ++k)
+            printf("    %s → 未覆盖 %lld\n", kKindName[k], perKind[k]);
+        Check(uncovered == 0, "存在像素差异没有被任何脏区 band 覆盖（会留残影）");
     }
 
     printf("\n%s (failures=%d)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);

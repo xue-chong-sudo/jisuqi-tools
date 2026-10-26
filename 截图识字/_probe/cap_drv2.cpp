@@ -64,12 +64,22 @@ static void DragTo(HWND w, int x0, int y0, int x1, int y1, int steps) {
 
 // 工具栏按钮中心（客户区坐标）。ktbW=236, kTbBtnW=68, kTbGap=8, kTbBtnH=28, kTbH=40
 //   按钮 id: x = 8 + (id-1)*(68+8)，宽 68 → 中心 x = 8+(id-1)*76+34；y 居中 = 20
+// 工具栏按钮中心（客户区坐标）。两行布局：
+//   行1 y=6..34（中心 20）：矩形30 椭圆82 箭头134 画笔186 撤销246 保存318 识别394 关闭470
+//   行2 y=44..68（中心 56）：颜色 i → 20+30i；粗细 i → 214+30i
+static POINT TbCenter(int id) {
+    if (id >= 20 && id <= 25) return POINT{ 20 + 30 * (id - 20), 56 };
+    if (id >= 30 && id <= 33) return POINT{ 214 + 30 * (id - 30), 56 };
+    static const int cx[9] = { 0, 30, 82, 134, 186, 246, 318, 394, 470 };
+    return POINT{ cx[id], 20 };
+}
+
 static void ClickTb(HWND tb, int id) {
-    int cx = 8 + (id - 1) * 76 + 34, cy = 20;
-    SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(cx, cy));
-    SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
-    SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
-    Sleep(250);
+    POINT p = TbCenter(id);
+    SendMessage(tb, WM_MOUSEMOVE, 0, MAKELPARAM(p.x, p.y));
+    SendMessage(tb, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(p.x, p.y));
+    SendMessage(tb, WM_LBUTTONUP, 0, MAKELPARAM(p.x, p.y));
+    Sleep(160);
 }
 
 static bool ReadClipboardDib(int& w, int& h) {
@@ -132,7 +142,7 @@ int main() {
             HWND tb = WaitClass(kTbClass, g_pid, 2000);
             Check(tb != nullptr, "S2 工具栏出现（进入调整态）");
             if (tb) {
-                ClickTb(tb, 3);                      // 3 = 关闭
+                ClickTb(tb, 8);                      // 8 = 关闭
                 Check(FindByClass(kMaskClass, g_pid) == nullptr, "S2 关闭后遮罩销毁");
                 Check(FindByClass(kTbClass, g_pid) == nullptr, "S2 关闭后工具栏也销毁");
                 int cw = 0, ch = 0;
@@ -154,7 +164,7 @@ int main() {
                 int my = (t + b) / 2;                // 左中把手中心 = (sel.left, 中线)
                 DragTo(mask, l, my, g_vx + 900, my, 12);   // 400 -> 900，越过右边界 800
                 Sleep(150);
-                ClickTb(tb, 1);                      // 1 = 保存
+                ClickTb(tb, 6);                      // 6 = 保存
                 Sleep(300);
                 Check(FindByClass(kMaskClass, g_pid) == nullptr, "S3 保存后遮罩销毁");
                 int cw = 0, ch = 0;

@@ -36,6 +36,9 @@ static void ResetSel(int l, int t, int r, int b) {
 }
 
 int main() {
+    // HoleFootprint 会按虚拟屏裁剪，先把假屏尺寸摆上（① 组还没走 ResetSel）
+    g.vx = 0; g.vy = 0; g.vw = 1920; g.vh = 1080;
+
     // ---------- ① 几何 ----------
     {
         RECT hs[8];
@@ -49,14 +52,39 @@ int main() {
         Check(Same(hs[5], 188, 196, 212, 204), "5 下中");
         Check(Same(hs[6],  96, 196, 104, 204), "6 左下");
         Check(Same(hs[7],  96, 138, 104, 162), "7 左中");
-        // 覆盖性：把手最远只伸到 ±4，足迹外扩 kHandleH=8 一定罩得住
+        // 覆盖性：把手必须整个落在 HoleFootprint 里 —— 这才是脏区依赖的真正的量。
+        // 旧断言写的是"把手最远只伸到 ±4，外扩 kHandleH=8 一定罩得住"，那个前提
+        // 在"选区比边中点把手还窄"时是错的：24px 长的上中把手会横向甩出洞外 12px
+        // （实测选区 4px 宽时把手是 (329,48)-(353,56)，而旧足迹右边界只有 351）。
         bool inside = true;
-        for (int i = 0; i < 8; ++i) {
-            if (hs[i].left < sel.left - kHandleH || hs[i].top < sel.top - kHandleH ||
-                hs[i].right > sel.right + kHandleH || hs[i].bottom > sel.bottom + kHandleH)
-                inside = false;
+        {
+            OverlayState st;
+            st.hole = sel;
+            st.adjust = true;
+            RECT fp = HoleFootprint(st);
+            for (int i = 0; i < 8; ++i) {
+                if (hs[i].left < fp.left || hs[i].top < fp.top ||
+                    hs[i].right > fp.right || hs[i].bottom > fp.bottom)
+                    inside = false;
+            }
         }
-        Check(inside, "八个把手全部落在 hole 外扩 kHandleH 的足迹内");
+        Check(inside, "八个把手全部落在 HoleFootprint 内");
+
+        // 反例守护：窄选区必须也能罩住（这正是上面那条旧断言漏掉的情况）
+        {
+            RECT narrow{ 339, 52, 343, 131 };      // 4px 宽
+            RECT hn[8];
+            BuildHandleRects(narrow, hn);
+            OverlayState st;
+            st.hole = narrow;
+            st.adjust = true;
+            RECT fp = HoleFootprint(st);
+            bool ok = true;
+            for (int i = 0; i < 8; ++i)
+                if (hn[i].left < fp.left || hn[i].right > fp.right ||
+                    hn[i].top < fp.top  || hn[i].bottom > fp.bottom) ok = false;
+            Check(ok, "4px 窄选区的把手也在足迹内（旧 8px 常数外扩在这里漏 2 列像素）");
+        }
     }
 
     // ---------- ② 命中 ----------
