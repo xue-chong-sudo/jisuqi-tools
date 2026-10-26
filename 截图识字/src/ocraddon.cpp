@@ -16,7 +16,14 @@ int ocraddon_capture_and_copy(void) {
         OcrRequestUnload();
         return 0;
     }
-    ShowResultAndCopy(std::move(img)); // 窗口先显示，OCR 在后台进行
+    // 调整态里点过"保存"/"识别文字"（或按了 ESC）：结果已经写进剪贴板，
+    // **不能再弹结果窗口**，否则用户会看到"原地保存完，又冒出一个窗口"。
+    // 现在这条是主路径；下面的 ShowResultAndCopy 只是兜底，实际走不到。
+    if (ShotAlreadyCopied()) {
+        OcrRequestUnload();
+        return 0;
+    }
+    ShowResultAndCopy(std::move(img)); // 兜底：仍走旧的结果窗口
     // 结果窗关闭后这里才返回：此时识别早已结束、引擎也已卸载，再压一次工作集，
     // 把结果窗那几张位图占的物理内存也还回去（否则会停在 10MB 左右）。
     OcrRequestUnload();
@@ -26,7 +33,8 @@ int ocraddon_capture_and_copy(void) {
 int ocraddon_capture_direct(void) {
     CaptureImage img = CaptureRegionInteractive();
     if (img.width == 0) return 0; // 取消：不碰剪贴板，避免覆盖用户已有内容
-    CopyImageToClipboard(img);    // 静默复制，无窗口、无提示
+    // 调整态退出时已写过剪贴板就别再写一次，否则 Win+V 历史里会多一条重复的图
+    if (!ShotAlreadyCopied()) CopyImageToClipboard(img);
     return 0;
 }
 

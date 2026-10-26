@@ -240,9 +240,15 @@ static std::thread             g_worker;
 static std::once_flag          g_workerOnce;
 
 static void OcrWorkerLoop() {
-    // OCR 是纯 CPU 密集的活（整屏图能跑满所有核心好几秒）。降到"低于正常"，
-    // 否则紧接着的下一次截图要拷屏 + 抹黑遮罩，会被 OCR 抢 CPU 拖成好几秒才出来
-    // （用户反馈的"截完一张要等 10 秒才能再截"就是这个）。
+    // 【本场景实测无收益，保留是为字幕场景，勿照本场景结论删】
+    // 实测（见 performance-analyst 的 bench_prio）：OCR 正在跑时触发下一次截图，
+    // 下一次遮罩首帧从 10.84ms → 11.45ms（7 个 NORMAL 优先级 worker）；降到
+    // BELOW_NORMAL 只拿回 0.27ms（噪声量级）。真正能伤到首帧的是**内存带宽**
+    // （访存型负载 10.84 → 24.44ms），而优先级对带宽无效（只拿回 7%）。
+    // 所以这条注释里"拖成好几秒"的因果不成立 —— 那 10 秒的真实原因更可能是进程
+    // 被 WM_QUIT 杀掉后要重新加载 OCR 引擎（见 capture.cpp 里 WM_DESTROY 那段注释）。
+    // 但字幕场景有实测收益（首屏 953ms→815ms），且我没测到它对 OCR 本身有害，
+    // 因此保留。要删请先补测"BELOW_NORMAL 让 OCR 慢多少"再决定。
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         std::shared_ptr<OcrJob> job;
@@ -278,6 +284,12 @@ static void OcrWorkerLoop() {
 }
 
 // 预热：触发截图的那一刻就调，用户还在框选，加载就已经在后台做完了。
+bool OcrEnsureEngine() {
+    // 同步加载（100~200ms）。仅在"调整态点识别文字"这条路径上用：
+    // 那里没有预热保证，而 OcrImage() 只"用"引擎不会"建"引擎。
+    return EnsureEngine();
+}
+
 void OcrPrewarm() {
     if (g_ocr) return;                       // 已经热着，什么都不用做
     std::call_once(g_workerOnce, [] { g_worker = std::thread(OcrWorkerLoop); });

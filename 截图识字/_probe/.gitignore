@@ -1,0 +1,6 @@
+*.exe
+*.obj
+*.log
+*_out.txt
+tmp/
+_commitmsg.txt

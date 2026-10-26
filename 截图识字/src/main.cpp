@@ -26,6 +26,21 @@ UINT g_msgTrigger = 0;          // RegisterWindowMessage 结果，与极速启�
 std::wstring g_iniPath;         // 极速启 data\settings.ini 绝对路径
 bool g_busy = false;            // 截图/识别进行中，忽略重复触发
 
+// 作用域守卫：把一次触发的**完整生命周期**标记为 busy。
+//
+// 为什么必须是 RAII 而不是手写 g_busy = false：
+//   1) 本分支内的 ocraddon_capture_and_copy() 最终会进入 CaptureRegionInteractive()
+//      的模态消息循环，重复触发必须挡在它**之前**，等结果窗口出来再判断已经晚了；
+//   2) 分支里存在 MessageBox 早退路径（下面 OCR 加载失败那支），手写的
+//      g_busy = false 每加一条早退就漏一次 —— 漏一次就等于整进程永久拒绝触发。
+//   3) WM_HOTKEY 那条路径不走这里（详见 HostProc），必须用同一个守卫才不会漏。
+struct BusyGuard {
+    BusyGuard()  { g_busy = true;  }
+    ~BusyGuard() { g_busy = false; }
+    BusyGuard(const BusyGuard&)            = delete;
+    BusyGuard& operator=(const BusyGuard&) = delete;
+};
+
 // 每次触发时读取最新设置（极速启保存设置即写 ini，无需重启本进程）
 void ReadShotSettings(int& mode, int& wrap, int& exitMode) {
     mode = 0; wrap = 1; exitMode = 0;
@@ -40,7 +55,7 @@ void ReadShotSettings(int& mode, int& wrap, int& exitMode) {
 LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_msgTrigger && m == g_msgTrigger) {
         if (g_busy) return 0;                 // 上一轮还没结束，吞掉重复触发
-        g_busy = true;
+        BusyGuard busy;                       // 覆盖整段，含下面的 MessageBox 早退
         int mode = 0, wrap = 1, exitMode = 0;
         ReadShotSettings(mode, wrap, exitMode);
         ocraddon_set_newline_smart(wrap);
@@ -56,21 +71,26 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                             L"OCR 识别引擎加载失败：请检查 screenshot\\tessdata 目录里的 "
                             L"chi_sim.traineddata / eng.traineddata 是否完整。",
                             L"截图识字", MB_ICONERROR);
-                g_busy = false;
-                return 0;
+                return 0;                     // busy 由 BusyGuard 析构释放
             }
             // 关键：在弹出选框之前就把引擎预读起来（约 0.1~0.2 秒）。用户还在
             // 框选的时候它已经加载完，感觉不到任何等待。
             ocraddon_prewarm();
             ocraddon_capture_and_copy();    // 启动识图：截图 -> OCR -> 选词复制
         }
-        g_busy = false;
-        return 0;
+        return 0;                           // busy 由 BusyGuard 析构释放
     }
     switch (m) {
-        case WM_HOTKEY:                        // 独立模式：Ctrl+Shift+S 触发
+        case WM_HOTKEY: {                       // 独立模式：Ctrl+Shift+S 触发
+            // 这条路径以前完全没有重入保护。危险点在于 ShowResultAndCopy 内部
+            // 还开着一层 GetMessage 循环（view.cpp），热键消息会被那层循环泵进来，
+            // 于是"上一轮选框还没提交"时又能开一轮；第二帧里的 `g = VState{}`
+            // 会把外层帧仍在使用的 img / words / annos 一并清掉。
+            if (g_busy) return 0;
+            BusyGuard busy;
             ocraddon_capture_and_copy();
             return 0;
+        }
         case WM_CLOSE: DestroyWindow(h); return 0;
         case WM_DESTROY: PostQuitMessage(0); break;
     }

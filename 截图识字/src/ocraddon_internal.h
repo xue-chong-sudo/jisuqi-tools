@@ -68,6 +68,17 @@ void SetExitMode(int exitMode);
 // 供“直接截图”模式使用；成功返回 true。
 bool CopyImageToClipboard(const CaptureImage& img);
 
+// 本轮截图是否已经在调整态里把结果写进剪贴板了（点过"保存"或"识别文字"）。
+// capture.cpp 提供，ocraddon.cpp 用它决定是否还要弹结果窗口。
+bool ShotAlreadyCopied();
+
+// 调整态的"识别文字"：对给定选区跑 OCR，并按用户定案的顺序写剪贴板 ——
+// **先写图、再写文字，两次独立的剪贴板会话**。
+// 这样直接 Ctrl+V 得到的是文字，而 Win+V 历史里"图、字"两条都在。
+// 合并成一次会话只会产生一条历史记录，Ctrl+V 拿到什么就由目标应用决定，
+// 正好与需求相反，所以这里刻意开两次会话。
+bool ShotOcrAndCopy(const CaptureImage& img);
+
 // 极速启 data\settings.ini 的绝对路径（main.cpp 提供）。用于把“上次保存目录”
 // 这类小状态放在同一个 data 目录里，不额外污染其它位置。取不到时返回空串。
 const wchar_t* ShotIniPath();
@@ -83,6 +94,11 @@ void OcrSetEngineParams(const wchar_t* tessdata, const wchar_t* lang);
 void OcrSetUnloadAfterUse(bool on);
 // 预热：把加载任务塞给后台工作线程，趁用户框选时完成。
 void OcrPrewarm();
+// **同步**确保引擎已加载（阻塞到加载完成，没有则返回 false）。
+// OcrImage() 只是"用"引擎，它自己**不会**加载 —— 调整态点"识别文字"走的是
+// 这条同步路径：那一刻可能既没预热（mode=1 直接截图模式根本不预热），
+// 预热也可能还没做完，直接调 OcrImage 会拿到空结果。
+bool OcrEnsureEngine();
 // Init 试过且失败（tessdata 缺失等），供宿主提示。
 bool OcrInitFailed();
 // 取消截图（没有产生识别任务）后卸载已预热的引擎（排队执行，不打断识别）。

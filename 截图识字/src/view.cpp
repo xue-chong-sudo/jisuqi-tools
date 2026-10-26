@@ -95,7 +95,14 @@ struct VState {
     Anno  cur;                       // 进行中的标注
 };
 VState g;
-std::mutex g_wordsMutex; // 保护 g.words：窗口线程读，OCR 工作线程写
+// 保护三样跨线程共享的东西：**必须成对使用**。
+//   1) g.words / g.ocrPending —— OCR 工作线程写，窗口线程读；
+//   2) g.hwnd —— 结果窗口句柄，UI 线程在 ShowResultAndCopy / WM_DESTROY 里写，
+//      工作线程回调时在锁内读取并 PostMessageW 投递刷新消息。
+// 因此"每一轮的重置"与"每一轮的结果发布"必须在同一把锁内完成，否则会出现
+// UI 刚清完、工作线程的延迟发布紧接着又填回来的半新半旧状态（表现为偶发的
+// 上一轮词表残影，不会崩、极难查）。
+std::mutex g_wordsMutex;
 static std::atomic<int> g_resultGen{0}; // 结果代次：新截图递增，旧 OCR 回调据此丢弃
 static int g_exitMode = 0;           // 退出方式：0=复制后直接退出（默认），1=复制后 ESC 退出
 
@@ -240,16 +247,32 @@ std::string CollectSelectedText() {
 }
 
 bool CopyTextToClipboard(HWND h, const std::string& utf8) {
+    if (utf8.empty()) return false;
     int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
     if (n <= 0) return false;
     HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (size_t)n * sizeof(wchar_t));
     if (!hg) return false;
     wchar_t* p = (wchar_t*)GlobalLock(hg);
+    if (!p) { GlobalFree(hg); return false; }
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, p, n);
     GlobalUnlock(hg);
-    if (!OpenClipboard(h)) { GlobalFree(hg); return false; }
+    // 决定 Ctrl+V 出来是什么的就是这一次写入，所以它不能像以前那样"零重试"：
+    // 剪贴板被别的进程占着时，恰好是这一次最容易失败，失败了用户看到的就是
+    // "复制成功了"但粘不出来。预算 4×20ms = 80ms，仍不阻塞。
+    bool opened = false;
+    for (int i = 0; i < 4; ++i) {
+        if (OpenClipboard(h)) { opened = true; break; }
+        Sleep(20);
+    }
+    if (!opened) { GlobalFree(hg); return false; }
     EmptyClipboard();
-    SetClipboardData(CF_UNICODETEXT, hg); // 成功后剪贴板拥有该内存
+    if (!SetClipboardData(CF_UNICODETEXT, hg)) {
+        // EmptyClipboard 已经把剪贴板清空了，这里必须如实返回失败，
+        // 否则调用方以为成功，而用户面对的是一块空剪贴板。
+        GlobalFree(hg);
+        CloseClipboard();
+        return false;
+    }
     CloseClipboard();
     return true;
 }
@@ -257,14 +280,37 @@ bool CopyTextToClipboard(HWND h, const std::string& utf8) {
 // 复制选中文字并按“退出方式”处理后续的辅助函数（定义见下方，先前向声明）。
 static void DoCopy(HWND h);
 
+void CopyAnnotatedToClipboard(HWND h);   // 定义在下方，此处补前向声明供 DoCopy 调用
+
+// 本次截图是否已经复制过文字。
+// 单独放在匿名命名空间而不是 VState 里：VState 会被 `g = VState{}` 整体重置，
+// 而这个标志必须跨"重置"存活到窗口关闭（ShowResultAndCopy 里手工清零）。
+// 作用：WM_DESTROY 只在【从未复制过文字】时才补写图片，避免把文字冲掉。
+static bool g_textCopied = false;
+
 // 复制选中的文字到剪贴板，并按“退出方式”处理后续：
 //   exit=0 复制后约 1 秒自动关闭；exit=1 复制后保持打开，等待 ESC 关闭。
 // 同时供右键菜单与 Ctrl+C 调用，避免逻辑重复。
+//
+// 剪贴板顺序（用户定案）：**先写图（含标注），再写文字，两次独立剪贴板会话**。
+//   · 直接 Ctrl+V → 文字（后写的那个生效）
+//   · Win+V 历史  → 图片在前、文字在后，两条都在，图片随时能翻出来
+// 旧实现在这里只写文字，随后 WM_DESTROY 又无条件把图写回去，正好把文字冲掉 ——
+// 结果与需求完全相反（粘贴出来是图，文字反而只剩历史）。现在 WM_DESTROY 只在
+// 从未复制过文字时才补写图片。
 static void DoCopy(HWND h) {
     if (!g.hasSel) return;
     std::string sel = CollectSelectedText();
     if (sel.empty()) return;
-    if (!CopyTextToClipboard(h, sel)) return;
+    CopyAnnotatedToClipboard(h);                 // ① 图（带标注的最终版）
+    if (!CopyTextToClipboard(h, sel)) {          // ② 文字：留在剪贴板上，供直接粘贴
+        // 图可能已经写进去了，文字没写成。明确告知，别让用户以为复制成功。
+        g.toast = true;
+        g.toastMsg = L"复制失败：剪贴板被占用";
+        InvalidateAll(h);
+        return;
+    }
+    g_textCopied = true;
     g.toast = true;
     g.toastMsg = (g_exitMode == 1) ? L"已复制到剪贴板（ESC 关闭）"
                                    : L"已复制到剪贴板";
@@ -1562,15 +1608,26 @@ LRESULT CALLBACK VWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         case WM_DESTROY:
-            // 退出时统一复制最终版图片（用户定案）：
+            // 退出时补写最终版图片，但**仅限从未复制过文字**的情况：
             //   ①不标注不识字直接退出 → 复制原图；
             //   ②标注后退出 → 复制最终标注图；
-            //   ③标注+识字：复制文字时剪贴板是文字，退出时再覆盖为最终标注图
-    //     （文字可凭 Windows+V 剪切板历史找回）。
+            //   ③已复制过文字 → 不写。此时剪贴板上的文字就是用户要的直接粘贴内容，
+            //      图片已在 DoCopy 里先一步写入，Win+V 历史里翻得到。
+            // 旧实现这里无条件覆盖，等于把刚复制的文字冲掉 —— 结果正好与需求
+            // 相反（粘贴出来是图，文字反而只剩历史）。现在由 g_textCopied 把关。
             // 覆盖所有退出路径：ESC / 右键关闭 / 复制文字后自动关闭。
-            if (g.img.width > 0 && g.img.height > 0)
+            if (!g_textCopied && g.img.width > 0 && g.img.height > 0)
                 CopyAnnotatedToClipboard(h);
             if (g.hSrc) { DeleteObject(g.hSrc); g.hSrc = nullptr; }
+            // 必须在退出前把窗口句柄摘掉（**锁内**）：OCR 工作线程会在 g_wordsMutex
+            // 内读 g.hwnd 并向它投递结果消息。若句柄留到 WM_DESTROY 之后，它就是一个
+            // 已销毁、甚至可能被系统复用给别的窗口的 HWND —— worker 的下一轮回调
+            // 会把消息投递到别人的窗口上。置空后 worker 侧对 nullptr 安全返回。
+            // 写入必须在锁内完成，因为 worker 的读取也在同一把锁内。
+            {
+                std::lock_guard<std::mutex> lk(g_wordsMutex);
+                g.hwnd = nullptr;
+            }
             PostQuitMessage(0);
             break;
     }
@@ -1585,6 +1642,31 @@ void SetLineMode(NewlineMode mode) { g_lineMode = mode; }
 
 // 退出方式全局开关（同样放匿名命名空间之外，供 ocraddon.cpp 设置）。
 void SetExitMode(int m) { g_exitMode = (m == 1) ? 1 : 0; }
+
+// 调整态"识别文字"：对给定选区跑 OCR，并按用户定案顺序写剪贴板。
+//
+// **顺序是"先图后字"，而且必须是两次独立的 OpenClipboard/CloseClipboard 会话：**
+//   · 直接 Ctrl+V → 文字（后写的那条生效）
+//   · Win+V 历史  → "图、字"两条都在，图片随时能翻出来
+// 做成一次会话（同一次里 SetClipboardData 两个格式）会毁掉这个效果：
+// 剪贴板观察者（含 Win+V 历史）在 CloseClipboard 之后才收到通知，一次会话
+// 只产生**一条**历史记录；而且图+字并存时 Ctrl+V 拿到什么由目标应用决定，
+// Word/WPS/微信输入框这类富文本目标大概率选图 —— 正好与需求相反。
+bool ShotOcrAndCopy(const CaptureImage& img) {
+    if (img.width <= 0 || img.height <= 0) return false;
+    // ① 先写图：哪怕 OCR 失败，用户至少还有一张图可取
+    CopyImageToClipboard(img);
+    // ② 再识别（同步）。这是用户主动点的按钮，等几百毫秒可以接受；
+    //    不为它引入异步 —— 异步会让"复制完就退出"的时序变得难以推理。
+    //    必须先同步把引擎拉起来：OcrImage() 只"用"引擎不会"建"引擎，而这条路径
+    //    之前可能压根没预热（mode=1 直接截图模式不预热），预热也可能还没做完。
+    OcrEnsureEngine();
+    std::vector<OcrWord> words = OcrImage(img);
+    std::string text = FormatSelection(words, g_lineMode);
+    if (text.empty()) return false;
+    // ③ 独立的第二次会话，把文字压到最上面
+    return CopyTextToClipboard(nullptr, text);
+}
 
 // 复制选中的文字到剪贴板，并按“退出方式”处理后续：
 //   exit=0 复制后约 1 秒自动关闭；exit=1 复制后保持打开，等待 ESC 关闭。
@@ -1626,16 +1708,24 @@ bool CopyImageToClipboard(const CaptureImage& img) {
         }
     }
     GlobalUnlock(hg);
-    // OpenClipboard 可能被其他进程长时间占用，阻塞会导致 UI 无响应。
-    // 这里做有限次重试，每次间隔 50ms，最多约 1 秒；仍失败则放弃本次复制。
+    // OpenClipboard 可能被其他进程占用，但重试预算必须小：ShowResultAndCopy 里
+    // 这段是在 CreateWindowEx **之前**跑的，旧实现 20×50ms = 最坏 1 秒，等于把
+    // 弹窗硬生生推迟 1 秒 —— 正是用户抱怨过的"截图后要等好久才出窗口"。
+    // 改为 4×20ms = 80ms 上限；偶尔写不进图，退出时还有一次补写机会。
     bool opened = false;
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (OpenClipboard(nullptr)) { opened = true; break; }
-        Sleep(50);
+        Sleep(20);
     }
     if (!opened) { GlobalFree(hg); return false; }
     EmptyClipboard();
-    if (!SetClipboardData(CF_DIB, hg)) GlobalFree(hg); // 成功后剪贴板接管内存
+    // EmptyClipboard 已经把剪贴板清空了，此时 SetClipboardData 若失败必须返回
+    // false：返回 true 会让调用方以为复制成功，而用户面对的是一块空剪贴板。
+    if (!SetClipboardData(CF_DIB, hg)) {   // 成功后剪贴板接管该内存，不可再 GlobalFree
+        GlobalFree(hg);
+        CloseClipboard();
+        return false;
+    }
     CloseClipboard();
     return true;
 }
@@ -1668,6 +1758,9 @@ void ShowResultAndCopy(CaptureImage img) {
         std::lock_guard<std::mutex> lk(g_wordsMutex);   // 与 OCR 回调互斥，安全重置
         if (g.hSrc) { DeleteObject(g.hSrc); g.hSrc = nullptr; }
         g = VState{};
+        // 新一轮截图：清空"已复制过文字"标志，重新允许退出时补写图片。
+        // 注意它不在 VState 里，不会被上面这行重置，必须在这里手工清零。
+        g_textCopied = false;
         g.img = std::move(img);
         g.ocrPending = true;
         g.s = 1.0; // 默认 1:1
@@ -1707,10 +1800,16 @@ void ShowResultAndCopy(CaptureImage img) {
     int x = mi.rcWork.left + (mw - ww) / 2;
     int y = mi.rcWork.top + (mh - wh) / 2;
 
-    g.hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"OCRView", L"OCRView",
-                             WS_POPUP | WS_VSCROLL | WS_HSCROLL | WS_VISIBLE,
-                             x, y, ww, wh,
-                             NULL, NULL, GetModuleHandle(NULL), NULL);
+    // g.hwnd 是 UI 线程写、OCR 工作线程读的共享变量（见上面回调与 WM_DESTROY 的
+    // 说明），所以赋值同样要走 g_wordsMutex，和另外两处成对。
+    HWND newHwnd = CreateWindowExW(WS_EX_APPWINDOW, L"OCRView", L"OCRView",
+                                   WS_POPUP | WS_VSCROLL | WS_HSCROLL | WS_VISIBLE,
+                                   x, y, ww, wh,
+                                   NULL, NULL, GetModuleHandle(NULL), NULL);
+    {
+        std::lock_guard<std::mutex> lk(g_wordsMutex);
+        g.hwnd = newHwnd;
+    }
     if (!g.hwnd) {
         printf("[view] CreateWindowEx failed, err=%lu\n", GetLastError());
         return;
@@ -1725,11 +1824,21 @@ void ShowResultAndCopy(CaptureImage img) {
     TbCreate();
     // 先显示图片；OCR 放到后台线程，完成后回填词表并刷新（高亮那时才可用）
     OcrImageAsync(g.img, [myGen](std::vector<OcrWord> words) {
-        std::lock_guard<std::mutex> lk(g_wordsMutex);
-        if (myGen != g_resultGen.load()) return;   // 旧一代结果，丢弃
-        g.words = std::move(words);
-        g.ocrPending = false;
-        if (g.hwnd) PostMessageW(g.hwnd, WM_APP + 1, 0, 0);
+        HWND target = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_wordsMutex);
+            if (myGen != g_resultGen.load()) return;   // 旧一代结果，丢弃
+            g.words = std::move(words);
+            g.ocrPending = false;
+            // 在锁内取句柄：WM_DESTROY 里摘句柄也在同一把锁内，所以这里取到的
+            // 要么是一个尚未进入销毁流程的窗口，要么是 nullptr。
+            target = g.hwnd;
+        }
+        // 通知必须放在锁外：PostMessageW 本身不会回调我方代码，但这处一旦将来被
+        // 改成 SendMessage 或加钩子，持锁等待 UI 线程回调就是死锁。
+        // target == nullptr 表示窗口已销毁，直接放弃这次刷新（数据照样留在
+        // g.words 里，下一次进结果窗口仍然可用）。
+        if (target) PostMessageW(target, WM_APP + 1, 0, 0);
     });
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }

@@ -37,9 +37,18 @@ static void EnsureDpi() {
     g_dpi = true;
 }
 
+// 交互阶段（微信截图同款）：
+//   Select —— 拖框选区（含吸附）；松手后有有效选区即转入 Adjust，不再销毁遮罩。
+//   Adjust —— 选区已定，可拖八个把手微调；ESC / 保存 = 裁剪并写入剪贴板后退出。
+enum class Phase { Select, Adjust };
+
 // 截图遮罩层状态（提前定义，供 EnumWnd 使用虚拟屏幕尺寸过滤窗口）。
 struct Cap {
     HWND w = nullptr;
+    Phase phase = Phase::Select;
+    int dragHandle = -1;     // Adjust 阶段正在拖的把手 0..7；-1 = 没在拖
+    bool saveToClip = false;  // 退出时把裁剪结果写进剪贴板（ESC / 保存）
+    bool ocrWanted  = false;  // 退出时对裁剪结果跑 OCR，并把文字也写进剪贴板（点"识别文字"）
     bool drag = false;
     POINT start = {0,0};
     POINT cur = {0,0}; // current mouse pos in virtual-screen coords
@@ -53,6 +62,12 @@ struct Cap {
     std::vector<unsigned char> dim;    // dimmed screen (BGRA, top-down), base for overlay
 };
 static Cap g;
+
+// 本轮是否已经把结果写进剪贴板。
+// 调整态里点"保存"/"识别文字"就已经落盘了，ocraddon.cpp 据此跳过 ShowResultAndCopy
+// —— 否则用户会看到"原地保存完，又弹出一个结果窗口"。
+static bool g_shotCopied = false;
+bool ShotAlreadyCopied() { return g_shotCopied; }
 
 // Enumerate visible top-level windows; used for hover-highlight and snap.
 //
@@ -278,6 +293,7 @@ struct OverlayState {
     int  textW = 0, textH = 0;
     bool labelValid = false;
     bool drag = false;          // 决定边框颜色（蓝=悬停 / 红=拖拽）
+    bool adjust = false;        // 调整态：画八个把手，且脏区 footprint 要外扩
 };
 static OverlayState g_prev;
 static bool g_prevValid = false;
@@ -307,6 +323,8 @@ static inline RECT RUnion(const RECT& a, const RECT& b) {
 }
 static bool SameOverlay(const OverlayState& a, const OverlayState& b) {
     if (a.drag != b.drag || a.labelValid != b.labelValid) return false;
+    // 进入/离开调整态会整体出现或消失八个把手，且 footprint 也会变（外扩 kHandleH）
+    if (a.adjust != b.adjust) return false;
     if (a.hole.left != b.hole.left || a.hole.top != b.hole.top ||
         a.hole.right != b.hole.right || a.hole.bottom != b.hole.bottom) return false;
     if (a.label.left != b.label.left || a.label.top != b.label.top ||
@@ -320,8 +338,12 @@ static bool SameOverlay(const OverlayState& a, const OverlayState& b) {
 static OverlayState BuildOverlayState() {
     OverlayState s;
     s.drag = g.drag;
+    s.adjust = (g.phase == Phase::Adjust);
     RECT hole = { 0, 0, 0, 0 };
-    if (g.drag && g.sel.right > g.sel.left && g.sel.bottom > g.sel.top) {
+    if (g.phase == Phase::Adjust) {
+        // 调整态：洞就是选区本身，绝不能再跟着鼠标下面的窗口跑
+        hole = g.sel;
+    } else if (g.drag && g.sel.right > g.sel.left && g.sel.bottom > g.sel.top) {
         hole = g.sel;
     } else if (!g.drag) {
         hole = FindHoveredWindow(g.cur);
@@ -332,8 +354,8 @@ static OverlayState BuildOverlayState() {
     s.hole = RIntersect(hole, RECT{0, 0, g.vw, g.vh});
     if (REmpty(s.hole)) return s;
 
-    // 尺寸标签只在拖拽态出现，位置与原实现一致（选区上方，放不下就压到选区内）
-    if (g.drag) {
+    // 尺寸标签在拖拽态与调整态都出现，位置与原实现一致（选区上方，放不下就压到选区内）
+    if (g.drag || g.phase == Phase::Adjust) {
         // 文字写进状态本身：它是"这一帧要画什么"的一部分，不是渲染用的临时量。
         // 之前放在全局 g_labelText 里、又不参与 SameOverlay 比较，于是标签矩形不动
         // 而数字在跳的那些帧被判成"没变"，标签永远停在旧尺寸。
@@ -447,10 +469,133 @@ static void PaintLabel(const RECT& band, const OverlayState& s) {
     }
 }
 
+// ---- 调整态的八个把手 ----
+// 编号：0=左上 1=上中 2=右上 3=右中 4=右下 5=下中 6=左下 7=左中
+constexpr int kHandleSize = 8;      // 角把手边长（8x8）
+constexpr int kEdgeHandleLen = 24;   // 边中点把手沿边方向的长度
+constexpr int kHandleH = 8;         // 脏区 footprint 的外扩量（必须 ≥ 把手半边长 4）
+
+// 入参与输出同一坐标系：绘制时传窗口坐标的 hole，命中测试时传虚拟屏坐标的 g.sel。
+static void BuildHandleRects(const RECT& sel, RECT out[8]) {
+    const int c = kHandleSize / 2;
+    const int e = kEdgeHandleLen / 2;
+    const int mx = (sel.left + sel.right) / 2;
+    const int my = (sel.top + sel.bottom) / 2;
+    out[0] = { sel.left  - c, sel.top    - c, sel.left  + c, sel.top    + c };
+    out[1] = { mx - e,        sel.top    - c, mx + e,        sel.top    + c };
+    out[2] = { sel.right - c, sel.top    - c, sel.right + c, sel.top    + c };
+    out[3] = { sel.right - c, my - e,        sel.right + c, my + e         };
+    out[4] = { sel.right - c, sel.bottom - c, sel.right + c, sel.bottom + c };
+    out[5] = { mx - e,        sel.bottom - c, mx + e,        sel.bottom + c };
+    out[6] = { sel.left  - c, sel.bottom - c, sel.left  + c, sel.bottom + c };
+    out[7] = { sel.left  - c, my - e,         sel.left  + c, my + e         };
+}
+
+// p 为虚拟屏坐标；非调整态一律返回 -1。
+static int HitHandle(POINT p) {
+    if (g.phase != Phase::Adjust) return -1;
+    RECT hs[8];
+    BuildHandleRects(g.sel, hs);
+    for (int i = 0; i < 8; ++i)
+        if (PtInRect(&hs[i], p)) return i;
+    return -1;
+}
+
+// 拖把手改选区：只动把手对应的那一/两条边，允许拖过对面（越过就交换，不夹死）。
+// 交换后必须把 dragHandle 重新映射到几何上同一个角/边，否则接下来拖的是错误那条边。
+static void ApplyHandleDrag(POINT p) {
+    if (g.dragHandle < 0) return;
+    int i = g.dragHandle;
+    switch (i) {
+        case 0: g.sel.left = p.x;  g.sel.top = p.y;    break;
+        case 1:                     g.sel.top = p.y;    break;
+        case 2: g.sel.right = p.x; g.sel.top = p.y;    break;
+        case 3: g.sel.right = p.x;                     break;
+        case 4: g.sel.right = p.x; g.sel.bottom = p.y; break;
+        case 5:                     g.sel.bottom = p.y; break;
+        case 6: g.sel.left = p.x;  g.sel.bottom = p.y; break;
+        case 7: g.sel.left = p.x;                      break;
+        default: break;
+    }
+    const bool swapX = g.sel.left > g.sel.right;
+    const bool swapY = g.sel.top > g.sel.bottom;
+    if (swapX) std::swap(g.sel.left, g.sel.right);
+    if (swapY) std::swap(g.sel.top, g.sel.bottom);
+    if (swapX) {
+        if (i == 0) i = 2; else if (i == 2) i = 0;
+        else if (i == 6) i = 4; else if (i == 4) i = 6;
+        else if (i == 7) i = 3; else if (i == 3) i = 7;
+    }
+    if (swapY) {
+        if (i == 0) i = 6; else if (i == 6) i = 0;
+        else if (i == 2) i = 4; else if (i == 4) i = 2;
+        else if (i == 1) i = 5; else if (i == 5) i = 1;
+    }
+    g.dragHandle = i;
+    // 钳回虚拟屏：把手可以拖到屏幕边缘，但不能拖出去
+    if (g.sel.left   < g.vx)       g.sel.left = g.vx;
+    if (g.sel.top    < g.vy)       g.sel.top = g.vy;
+    if (g.sel.right  > g.vx+ g.vw) g.sel.right = g.vx + g.vw;
+    if (g.sel.bottom > g.vy+ g.vh) g.sel.bottom = g.vy + g.vh;
+}
+
+// 把手绘制。必须排在 PaintHole / PaintBorder **之后**：把手跨洞边界、一半落在洞内，
+// 先画会被 PaintHole 用干净像素整块覆盖，只剩下洞外那半边。
+static void PaintHandles(const RECT& band, const OverlayState& s) {
+    if (!s.adjust || REmpty(s.hole)) return;
+    RECT hs[8];
+    BuildHandleRects(s.hole, hs);
+    for (int i = 0; i < 8; ++i) {
+        // 白底
+        RECT r = RIntersect(band, hs[i]);
+        if (!REmpty(r)) {
+            for (int y = r.top; y < r.bottom; ++y) {
+                BYTE* row = (BYTE*)g.bits + ((size_t)y * g.vw + r.left) * 4;
+                for (int x = r.left; x < r.right; ++x) {
+                    row[0] = 255; row[1] = 255; row[2] = 255; row[3] = 255;
+                    row += 4;
+                }
+            }
+        }
+        // 1px 蓝描边（白块在浅色桌面上也要看得见）。同样按 band 裁剪，
+        // 且统一写 alpha=255，守住"g.bits 里任何像素 alpha == 255"这条不变量。
+        RECT edges[4] = {
+            { hs[i].left,      hs[i].top,        hs[i].right,     hs[i].top + 1    },
+            { hs[i].left,      hs[i].bottom - 1, hs[i].right,     hs[i].bottom     },
+            { hs[i].left,      hs[i].top,        hs[i].left + 1,  hs[i].bottom     },
+            { hs[i].right - 1, hs[i].top,        hs[i].right,     hs[i].bottom     },
+        };
+        for (int k = 0; k < 4; ++k) {
+            RECT e = RIntersect(band, edges[k]);
+            if (REmpty(e)) continue;
+            for (int y = e.top; y < e.bottom; ++y) {
+                BYTE* row = (BYTE*)g.bits + ((size_t)y * g.vw + e.left) * 4;
+                for (int x = e.left; x < e.right; ++x) {
+                    row[0] = 215; row[1] = 120; row[2] = 0; row[3] = 255;  // RGB(0,120,215)
+                    row += 4;
+                }
+            }
+        }
+    }
+}
+
+// 洞的「绘制足迹」：调整态要外扩 kHandleH，因为八个把手是跨洞边界画的，
+// 有一半在洞外。用**一个**外扩矩形表达（而不是 4 条 ring 带）是为了让
+// StateRegion 恒为「1 个洞矩形 + 1 个标签矩形」：脏区是前后两个状态的 XOR，
+// footprint 的 rect 数越少，XOR 出来的 rect 就越少，越不会因为超过 kBandCap
+// 而走溢出合并。覆盖性由构造保证：角把手 x∈[left-4,left+4] ⊂ [left-8,right+8]。
+static RECT HoleFootprint(const OverlayState& s) {
+    if (!s.adjust) return s.hole;
+    RECT r = { s.hole.left - kHandleH, s.hole.top - kHandleH,
+               s.hole.right + kHandleH, s.hole.bottom + kHandleH };
+    return RIntersect(r, RECT{ 0, 0, g.vw, g.vh });
+}
+
 static HRGN StateRegion(const OverlayState& s) {
     HRGN r = CreateRectRgn(0, 0, 0, 0);
-    if (!REmpty(s.hole)) {
-        HRGN h = CreateRectRgnIndirect(&s.hole);
+    RECT fp = HoleFootprint(s);
+    if (!REmpty(fp)) {
+        HRGN h = CreateRectRgnIndirect(&fp);
         CombineRgn(r, r, h, RGN_OR);
         DeleteObject(h);
     }
@@ -487,11 +632,15 @@ static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
     HRGN rb = StateRegion(b);
     HRGN d = CreateRectRgn(0, 0, 0, 0);
     CombineRgn(d, ra, rb, RGN_XOR);
-    // 只有边框颜色变了（悬停↔拖拽）时区域异或为空，但颜色必须重画
-    if (a.drag != b.drag && !REmpty(a.hole)) {
-        HRGN h = CreateRectRgnIndirect(&a.hole);
-        CombineRgn(d, d, h, RGN_OR);
-        DeleteObject(h);
+    // 边框颜色变了（悬停↔拖拽）或把手整体出现/消失（进出调整态）时，区域异或
+    // 可能为空但必须重画。这里要并的是**足迹**而不是裸 hole：把手有一半在洞外。
+    if ((a.drag != b.drag || a.adjust != b.adjust) && !REmpty(a.hole)) {
+        RECT fp = HoleFootprint(a);
+        if (!REmpty(fp)) {
+            HRGN h = CreateRectRgnIndirect(&fp);
+            CombineRgn(d, d, h, RGN_OR);
+            DeleteObject(h);
+        }
     }
 
     // 先把所有矩形收进 vector 再合并。旧实现直接往 out[] 里写、超限部分塞进
@@ -518,7 +667,8 @@ static int BuildDirtyBands(const OverlayState& a, const OverlayState& b,
 
     // 贪心合并：先按"总成本是否下降"自愿合并，数量仍超上限就强行压到 cap。
     // 比较的是**整帧总成本**（BandCost(n, Σ面积)），不是两条合并前后的边际差——
-    // 后者看不出 4→5 条那道阶跃悬崖。
+    // 后者只算这两条自己的面积增量，看不见"多留一条就多付一次整帧调用开销"。
+    // （这里原写过"看不出 4→5 条那道阶跃悬崖"；那道悬崖已被撤回，见上。）
     int n = (int)v.size();
     for (;;) {
         if (n < 2) break;
@@ -573,43 +723,13 @@ static void PushBand(const RECT& band, bool full) {
     pULWI(g.w, &info);
 }
 
-// ---- 临时插桩（量完删除）----
-static double g_perfMs[512];
-static int    g_perfN = 0;
-static double PerfNow() {
-    static LARGE_INTEGER f = {0};
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
-}
-static bool PerfOn() {
-    static int on = -1;
-    if (on < 0) on = getenv("JISUQI_CAP_PERF") ? 1 : 0;
-    return on == 1;
-}
-static void PerfDump() {
-    if (!PerfOn() || g_perfN == 0) return;
-    std::vector<double> v(g_perfMs, g_perfMs + g_perfN);
-    std::sort(v.begin(), v.end());
-    auto q = [&](double p) { int i = (int)(p * (v.size() - 1)); return v[i]; };
-    FILE* fp = fopen("capture_perf.log", "a");
-    if (fp) {
-        fprintf(fp, "frames=%d  P50=%.2f  P95=%.2f  P99=%.2f  max=%.2f\n",
-                g_perfN, q(0.50), q(0.95), q(0.99), v.back());
-        fclose(fp);
-    }
-    g_perfN = 0;
-}
-
 static void Redraw() {
     if (g.dim.empty() || !g.w || !g.bits) return;
-    const double t0 = PerfOn() ? PerfNow() : 0;
 
     OverlayState next = BuildOverlayState();
     const bool firstFrame = !g_prevValid;
     // 状态没变 → 一个字都不画（同窗口内拖动/悬停的全部帧都走这里）
     if (!firstFrame && !g_renderFull && SameOverlay(g_prev, next)) {
-        if (PerfOn() && g_perfN < 512) g_perfMs[g_perfN++] = PerfOn() ? (PerfNow() - t0) : 0;
         return;
     }
 
@@ -627,12 +747,174 @@ static void Redraw() {
         RestoreFromDim(bands[i]);
         PaintHole(bands[i], next);
         PaintBorder(bands[i], next);
+        PaintHandles(bands[i], next);   // 必须在 PaintHole 之后：把手有一半在洞内
         PaintLabel(bands[i], next);
         PushBand(bands[i], firstFrame || g_renderFull);
     }
     g_prev = next;
     g_prevValid = true;
-    if (PerfOn() && g_perfN < 512) g_perfMs[g_perfN++] = PerfNow() - t0;
+}
+
+// ---- 调整态的工具栏（保存 / 关闭）----
+// 两条硬约束决定了它只能是**独立顶层 popup**，绝不能是遮罩的子窗、也不能画进 g.bits：
+//   ① 遮罩是 WS_EX_LAYERED 的 WS_POPUP，分层窗口不能有子窗口（子窗根本不会被绘制）；
+//   ② 画进 g.bits 会同时撞上"GDI 画字把字形像素 alpha 写成 0"（要整块补写回 255）
+//      和"多一条 band 吃掉 kBandCap 预算"两个坑。
+// 所以：独立 WS_POPUP + WS_EX_TOPMOST 压在遮罩之上；点击不抢焦点
+// （WM_MOUSEACTIVATE 返回 MA_NOACTIVATE），否则遮罩收不到 ESC。
+// 三个按钮：1=保存（ESC 同义，主按钮）2=识别文字 3=关闭
+constexpr int kTbBtnW = 68, kTbBtnH = 28, kTbGap = 8;
+constexpr int kTbW = kTbGap * 4 + kTbBtnW * 3, kTbH = 40;
+enum { kTbSave = 1, kTbOcr = 2, kTbClose = 3 };
+static HWND g_tb = nullptr;
+static int  g_tbHot = 0;    // 悬停的按钮
+static int  g_tbPress = 0;  // 已按下尚未松开的按钮
+static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l);  // TbCreate 需要
+
+static RECT TbButtonRect(int id) {
+    int x = kTbGap + (id - 1) * (kTbBtnW + kTbGap);
+    int y = (kTbH - kTbBtnH) / 2;
+    return { x, y, x + kTbBtnW, y + kTbBtnH };
+}
+static int TbHitTest(POINT pt) {
+    // 不能对 TbButtonRect 的临时返回值取地址（C2102），先落到局部变量
+    for (int id = kTbSave; id <= kTbClose; ++id) {
+        RECT r = TbButtonRect(id);
+        if (PtInRect(&r, pt)) return id;
+    }
+    return 0;
+}
+
+// 收尾：销毁工具栏，置退出标志。裁剪与剪贴板统一在 CaptureRegionInteractive
+// 尾部做（只裁一次，这里不重复）。
+//   action = 0 取消 / 1 只保存图片 / 2 识别文字（先图后字）
+static void FinishAdjust(int action) {
+    if (g_tb) { DestroyWindow(g_tb); g_tb = nullptr; }
+    // 只有"保存"和"识别文字"才算拿到结果；点"关闭"等于取消
+    g.captured   = (action == kTbSave || action == kTbOcr);
+    g.saveToClip = (action == kTbSave);
+    g.ocrWanted  = (action == kTbOcr);
+    g.done = true;
+    if (g.w) DestroyWindow(g.w);
+}
+
+// 工具栏跟随选区：优先贴在选区正下方居中，下方放不下改上方，再钳回工作区。
+static void TbReposition() {
+    if (!g_tb) return;
+    RECT s = g.sel;
+    HMONITOR hm = MonitorFromRect(&s, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    RECT wa;
+    if (GetMonitorInfo(hm, &mi)) wa = mi.rcWork;
+    else wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    int x = (s.left + s.right) / 2 - kTbW / 2;
+    int y = s.bottom + 8;
+    if (y + kTbH > wa.bottom - 8) y = s.top - 8 - kTbH;
+    if (y < wa.top + 8) y = wa.top + 8;
+    // RECT 成员是 LONG、x 是 int，混用会让 std::min/max 模板推导失败（LONG≠int）
+    x = std::max((int)wa.left + 8, std::min(x, (int)wa.right - 8 - kTbW));
+    SetWindowPos(g_tb, NULL, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void TbCreate() {
+    if (g_tb) { DestroyWindow(g_tb); g_tb = nullptr; }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = TbProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        wc.lpszClassName = L"OCRCapTb";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    g_tb = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"OCRCapTb", L"",
+                            WS_POPUP, 0, 0, kTbW, kTbH,
+                            NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (!g_tb) return;
+    g_tbHot = 0;
+    g_tbPress = 0;
+    TbReposition();
+    ShowWindow(g_tb, SW_SHOWNOACTIVATE);
+}
+
+static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT rc{ 0, 0, kTbW, kTbH };
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP mb = CreateCompatibleBitmap(dc, kTbW, kTbH);
+            HGDIOBJ ob = SelectObject(mem, mb);
+            HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
+            FillRect(mem, &rc, bg);
+            DeleteObject(bg);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(210, 214, 220));
+            HGDIOBJ op = SelectObject(mem, pen);
+            Rectangle(mem, 0, 0, kTbW, kTbH);
+            SelectObject(mem, op);
+            DeleteObject(pen);
+            HFONT f = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                  CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                  DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+            HGDIOBJ of = SelectObject(mem, f);
+            SetBkMode(mem, TRANSPARENT);
+            static const wchar_t* kLabel[4] = { L"", L"保存", L"识别文字", L"关闭" };
+            for (int id = kTbSave; id <= kTbClose; ++id) {
+                RECT r = TbButtonRect(id);
+                bool on = (g_tbPress == id) || (g_tbPress == 0 && g_tbHot == id);
+                const bool primary = (id == kTbSave);
+                COLORREF fill = primary
+                    ? (on ? RGB(0, 95, 180) : RGB(0, 120, 215))
+                    : (on ? RGB(225, 228, 232) : RGB(240, 242, 245));
+                HBRUSH bb = CreateSolidBrush(fill);
+                FillRect(mem, &r, bb);
+                DeleteObject(bb);
+                SetTextColor(mem, primary ? RGB(255, 255, 255) : RGB(60, 60, 60));
+                DrawTextW(mem, kLabel[id], -1, &r,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            SelectObject(mem, of);
+            DeleteObject(f);
+            BitBlt(dc, 0, 0, kTbW, kTbH, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, ob);
+            DeleteObject(mb);
+            DeleteDC(mem);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            int hit = TbHitTest(pt);
+            if (hit != g_tbHot) { g_tbHot = hit; InvalidateRect(h, NULL, FALSE); }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            g_tbPress = TbHitTest(pt);
+            SetCapture(h);
+            InvalidateRect(h, NULL, FALSE);
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            int hit = TbHitTest(pt);
+            int press = g_tbPress;
+            g_tbPress = 0;
+            ReleaseCapture();
+            InvalidateRect(h, NULL, FALSE);
+            if (press != 0 && press == hit) FinishAdjust(press);   // 1保存 / 2识别文字 / 3关闭
+            return 0;
+        }
+        case WM_MOUSEACTIVATE:
+            // 点击不抢焦点：焦点留在遮罩上，ESC / 方向键始终归遮罩
+            return MA_NOACTIVATE;
+    }
+    return DefWindowProc(h, m, w, l);
 }
 
 static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -641,6 +923,13 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             POINT p;
             p.x = GET_X_LPARAM(l) + g.vx;
             p.y = GET_Y_LPARAM(l) + g.vy;
+            if (g.phase == Phase::Adjust) {
+                // 调整态：命中把手则开始拖把手；点在选区里什么都不做
+                // （避免误触把刚调好的选区清掉）
+                int i = HitHandle(p);
+                if (i >= 0) { g.dragHandle = i; SetCapture(h); Redraw(); }
+                break;
+            }
             // 起点也吸附：从窗口角/边上起拖，整框才会跟着窗口对齐（微信同款）。
             // 之前只吸附移动中的那个点，起点留在鼠标原始位置，导致"一边对齐一边差几像素"。
             Snap(p);
@@ -653,6 +942,12 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             p.x = GET_X_LPARAM(l) + g.vx;
             p.y = GET_Y_LPARAM(l) + g.vy;
             g.cur = p;
+            if (g.phase == Phase::Adjust && g.dragHandle >= 0) {
+                ApplyHandleDrag(p);
+                TbReposition();
+                Redraw();
+                break;
+            }
             if (g.drag) {
                 Snap(p);
                 g.sel = Norm(g.start, p);
@@ -661,6 +956,10 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
         }
         case WM_LBUTTONUP:
+            if (g.phase == Phase::Adjust) {
+                if (g.dragHandle >= 0) { g.dragHandle = -1; ReleaseCapture(); Redraw(); }
+                break;
+            }
             if (g.drag) {
                 g.drag = false; ReleaseCapture();
                 int dx = std::abs(g.start.x - g.cur.x);
@@ -668,23 +967,32 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (dx < 5 && dy < 5) {
                     // Single click: capture the whole hovered window.
                     RECT hov = FindHoveredWindow(g.start);
-                    if (hov.right > hov.left) {
-                        g.sel = hov;
-                        g.captured = true;
-                    }
-                } else {
-                    // Manual drag: capture the selection box.
-                    g.captured = true;
+                    if (hov.right > hov.left) g.sel = hov;
                 }
-                g.done = true; DestroyWindow(h);
+                // 不再销毁遮罩：有有效选区就进入调整态（微信截图同款），
+                // 由 ESC / 保存 决定最终落盘。选区太小（误点）则留在选区态。
+                if (g.sel.right - g.sel.left >= 2 && g.sel.bottom - g.sel.top >= 2) {
+                    g.phase = Phase::Adjust;
+                    TbCreate();
+                    Redraw();
+                }
             }
             break;
         case WM_RBUTTONDOWN:
-            // Right-click cancels capture, just like ESC.
-            g.captured = false; g.done = true; DestroyWindow(h);
+            // 右键 = 取消（选区态与调整态都是）
+            FinishAdjust(false);
             break;
         case WM_KEYDOWN:
-            if (w == VK_ESCAPE) { g.captured = false; g.done = true; DestroyWindow(h); break; }
+            if (w == VK_ESCAPE) {
+                // 选区态 ESC = 取消；调整态 ESC = 保存（用户定案）
+                if (g.phase == Phase::Adjust) FinishAdjust(kTbSave);
+                else {
+                    g.captured = false; g.saveToClip = false; g.ocrWanted = false;
+                    g.done = true; DestroyWindow(h);
+                }
+                break;
+            }
+            if (w == VK_RETURN && g.phase == Phase::Adjust) { FinishAdjust(kTbSave); break; }
             // 方向键微调：1px，按住 Shift 10px。吸附完还差一两个像素时不用再抖鼠标。
             {
                 const int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
@@ -694,16 +1002,46 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else if (w == VK_UP)    dy = -step;
                 else if (w == VK_DOWN)  dy =  step;
                 else break;
-                g.cur.x += dx; g.cur.y += dy;
-                if (g.drag) {
-                    POINT q = g.cur;
-                    Snap(q);
-                    g.sel = Norm(g.start, q);
+                if (g.phase == Phase::Adjust) {
+                    // 调整态：整体平移选区（钳回虚拟屏）
+                    OffsetRect(&g.sel, dx, dy);
+                    if (g.sel.left   < g.vx)       { OffsetRect(&g.sel, g.vx - g.sel.left, 0); }
+                    if (g.sel.right  > g.vx+ g.vw){ OffsetRect(&g.sel, g.vx + g.vw - g.sel.right, 0); }
+                    if (g.sel.top    < g.vy)       { OffsetRect(&g.sel, 0, g.vy - g.sel.top); }
+                    if (g.sel.bottom > g.vy+ g.vh){ OffsetRect(&g.sel, 0, g.vy + g.vh - g.sel.bottom); }
+                    TbReposition();
+                } else {
+                    g.cur.x += dx; g.cur.y += dy;
+                    if (g.drag) {
+                        POINT q = g.cur;
+                        Snap(q);
+                        g.sel = Norm(g.start, q);
+                    }
                 }
                 Redraw();
             }
             break;
+        case WM_SETCURSOR: {
+            if (g.phase == Phase::Adjust) {
+                POINT sp;
+                GetCursorPos(&sp);
+                int i = HitHandle(sp);
+                if (i >= 0) {
+                    // IDC_* 是 TCHAR 中性的 MAKEINTRESOURCE，用 TCHAR* 承接才与
+                    // 当前编译是否定义 UNICODE 一致
+                    static const TCHAR* kCur[8] = {
+                        IDC_SIZENWSE, IDC_SIZENS, IDC_SIZENESW, IDC_SIZEWE,
+                        IDC_SIZENWSE, IDC_SIZENS, IDC_SIZENESW, IDC_SIZEWE,
+                    };
+                    SetCursor(LoadCursor(NULL, kCur[i]));
+                    return TRUE;
+                }
+            }
+            break;   // 其余交给 DefWindowProc（用类光标 IDC_CROSS）
+        }
         case WM_DESTROY:
+            // 遮罩没了工具栏也跟着走（正常路径走 FinishAdjust，这里是兜底）
+            if (g_tb) { DestroyWindow(g_tb); g_tb = nullptr; }
             // 注意：这里**不能** PostQuitMessage。
             // 本窗口的消息循环是靠 g.done 跳出的（见 CaptureRegionInteractive 末尾），
             // 跳出时不会去取 WM_QUIT；残留的 WM_QUIT 会被外层的宿主主循环读到，
@@ -712,6 +1050,14 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
     }
     return DefWindowProc(h, m, w, l);
+}
+
+// 整屏干净像素（1080p ≈ 8.3MB / 4K ≈ 33MB / 双 4K ≈ 66MB）在 CaptureRegionInteractive
+// 返回后本来会一直驻留到下一次截图。截图结束就还回去 —— OCR 阶段根本用不到它，
+// 而且调整态一结束遮罩也该销毁（常驻分层表面本身就有空闲 CPU 开销）。
+static void ReleaseScreenBuffers() {
+    g.screen.clear(); g.screen.shrink_to_fit();
+    g.dim.clear();    g.dim.shrink_to_fit();
 }
 
 CaptureImage CaptureRegionInteractive() {
@@ -723,6 +1069,7 @@ CaptureImage CaptureRegionInteractive() {
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     g = Cap{};
+    g_shotCopied = false;      // 新一轮：清空"已写剪贴板"标记
     g.vx = vx; g.vy = vy; g.vw = vw; g.vh = vh;
     // 渲染状态复位：首帧走整窗上传；render_full=1 可强制回到旧的整窗路径
     g_prevValid = false;
@@ -856,7 +1203,7 @@ CaptureImage CaptureRegionInteractive() {
     DeleteObject(g.hDib);
     DeleteDC(g.hDc);
 
-    if (!g.captured) return CaptureImage{};
+    if (!g.captured) { ReleaseScreenBuffers(); return CaptureImage{}; }
 
     // Clamp selection to virtual screen bounds.
     RECT s = g.sel;
@@ -865,7 +1212,7 @@ CaptureImage CaptureRegionInteractive() {
     if (s.right  > g.vx + g.vw) s.right = g.vx + g.vw;
     if (s.bottom > g.vy + g.vh) s.bottom = g.vy + g.vh;
     int rw = s.right - s.left, rh = s.bottom - s.top;
-    if (rw < 2 || rh < 2) return CaptureImage{};
+    if (rw < 2 || rh < 2) { ReleaseScreenBuffers(); return CaptureImage{}; }
 
     // Crop from the CLEAN original screen buffer (no overlay, no dimming).
     CaptureImage out;
@@ -884,7 +1231,18 @@ CaptureImage CaptureRegionInteractive() {
         }
     }
 
-    PerfDump();
+    // 调整态退出：裁剪只在这里做一次，然后按"保存"还是"识别文字"分流。
+    // 两条路都算"已写过剪贴板"，由 ShotAlreadyCopied() 告诉 ocraddon.cpp
+    // 不要再弹结果窗口（否则原地保存完还会再弹一次窗）。
+    if (g.ocrWanted) {
+        g_shotCopied = true;
+        ShotOcrAndCopy(out);      // 内部：先写图、再跑 OCR、再写文字（两次独立剪贴板会话）
+    } else if (g.saveToClip) {
+        g_shotCopied = true;
+        CopyImageToClipboard(out);
+    }
+
+    ReleaseScreenBuffers();
     g_wins.clear();
     return out;
 }
