@@ -8,8 +8,21 @@
 //   - 异步实现：探针随到随回，延迟是亚毫秒级
 // 之后再按 ESC，确认文字确实被认出来了（异步不是"不认了"）。
 #include <windows.h>
+#include <psapi.h>      // GetProcessMemoryInfo：量宿主工作集，验"遮罩期间不卸载"
 #include <cstdio>
 #include <vector>
+
+// 宿主进程当前工作集（MB）。读不到返回 -1（权限/进程已退）。
+static double WorkingSetMB(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return -1.0;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    double mb = -1.0;
+    if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc)))
+        mb = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+    CloseHandle(h);
+    return mb;
+}
 
 static const wchar_t* kHostClass = L"JisuQiShotHost";
 static const wchar_t* kMaskClass = L"OCRCap";
@@ -161,6 +174,12 @@ int main() {
     Check(worst < 120.0, "识别期间 UI 线程没有被冻住（最差延迟 < 120ms）");
     Check(NowMs() - tUp > 300, "探针覆盖区间确实跨过了识别耗时（>300ms 才有意义）");
 
+    // ---- 遮罩存活期间引擎不卸载（用户明确要求：宁可多占几十 MB）----
+    // 判据用宿主进程的工作集：识别完仍驻留 ≈ 几十 MB；一旦收尾卸载会掉到个位数。
+    const double wsOpen = WorkingSetMB(pid);
+    printf("[drv7]      识别完成后宿主工作集 = %.1f MB（遮罩还开着）\n", wsOpen);
+    Check(wsOpen > 20.0, "遮罩存活期间引擎没有卸载（工作集 > 20MB）");
+
     // ---- 异步不等于不认：ESC 收尾后剪贴板里要有文字 ----
     Msg(WM_KEYDOWN, VK_ESCAPE, 0, 0);
     Msg(WM_KEYUP, VK_ESCAPE, 0, 0);
@@ -174,6 +193,13 @@ int main() {
         bool hasDigit = wcschr(txt, L'8') != nullptr || wcschr(txt, L'9') != nullptr;
         Check(hasDigit, "认出的文字里含测试串的数字（说明认出的是那块字）");
     }
+
+    // ---- 收尾后必须把引擎还回去（否则静默常驻几十 MB）----
+    Sleep(800);
+    const double wsClosed = WorkingSetMB(pid);
+    printf("[drv7]      收尾后宿主工作集 = %.1f MB（遮罩已关）\n", wsClosed);
+    Check(wsClosed > 0 && wsOpen - wsClosed > 15.0,
+          "收尾后引擎被卸载、工作集回落（差值 > 15MB）");
 
     if (g_tw) DestroyWindow(g_tw);
     printf("\n%s（失败项 %d）\n", g_fail ? "FAILED" : "ALL PASS", g_fail);

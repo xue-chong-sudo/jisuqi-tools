@@ -97,6 +97,9 @@ void OcrShutdown();
 void OcrSetEngineParams(const wchar_t* tessdata, const wchar_t* lang);
 // 每次识别完成后是否立刻卸载引擎并把工作集还给系统。
 void OcrSetUnloadAfterUse(bool on);
+// 读回当前策略：遮罩/结果窗要"临时关掉卸载、收尾再恢复"，必须能取到原值，
+// 否则独立模式（默认不卸载）会被宿主的策略污染。
+bool OcrGetUnloadAfterUse();
 // 预热：把加载任务塞给后台工作线程，趁用户框选时完成。
 void OcrPrewarm();
 // **同步**确保引擎已加载（阻塞到加载完成，没有则返回 false）。

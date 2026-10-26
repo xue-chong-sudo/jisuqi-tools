@@ -118,6 +118,8 @@ void OcrSetUnloadAfterUse(bool on) {
     g_unloadAfterUse = on;
 }
 
+bool OcrGetUnloadAfterUse() { return g_unloadAfterUse; }
+
 bool OcrInitFailed() { return g_initFailed; }
 
 // 确保引擎可用（工作线程调用；加载耗时才 100~200ms）

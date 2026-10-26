@@ -30,6 +30,9 @@ bool ShotCopyImageThenText(const CaptureImage&, const std::string&) { return fal
 bool OcrEnsureEngine() { return false; }
 std::vector<OcrWord> OcrImage(const CaptureImage&) { return {}; }
 void OcrImageAsync(const CaptureImage&, std::function<void(std::vector<OcrWord>)>) {}
+bool OcrGetUnloadAfterUse() { return false; }
+void OcrSetUnloadAfterUse(bool) {}
+void OcrRequestUnload() {}
 std::string FormatSelection(const std::vector<OcrWord>&, NewlineMode) { return {}; }
 
 #include <cstdio>

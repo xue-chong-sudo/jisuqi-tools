@@ -1831,13 +1831,39 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             break;
         }
         case kTbText: {
-            // 「文」不再用字体画。用户："也太丑了、太大了，和周围都不统一，笔画的粗细都不一样" ——
-            // 26px 的中文字横细竖粗，和旁边 3.2f 等粗的线形图标根本不是一套语言。
-            // 现在用**同一支笔**（3.2f 圆头圆角）手画四笔：点、横、撇、捺，字面框 22x22。
-            gr.DrawLine(&pen, gp::PointF(cx + 0.5f, cy - 10.5f), gp::PointF(cx + 3.5f, cy - 8.0f));  // 点
-            gr.DrawLine(&pen, gp::PointF(cx - 10.5f, cy - 4.0f), gp::PointF(cx + 10.5f, cy - 4.0f)); // 横
-            gr.DrawLine(&pen, gp::PointF(cx + 1.5f, cy - 4.0f), gp::PointF(cx - 9.0f, cy + 10.5f));   // 撇
-            gr.DrawLine(&pen, gp::PointF(cx + 1.5f, cy - 4.0f), gp::PointF(cx + 9.5f, cy + 10.5f));   // 捺
+            // 微信「文字识别」同款：四角取景框 + 中间一个「文」。
+            // 用户原话："文字识别能不能按照微信这个设计，一模一样就行"。
+            // 取景框四个角是"圆头圆角的 L"：用三点路径 + 圆头圆角画，拐角自然带
+            // 圆弧，不用另外拼 AddArc。中心「文」用同一支笔的缩小版（笔画更细一档，
+            // 否则 11px 见方的字四笔会并成一团）。
+            const float L = cx - 11.0f, T = cy - 11.0f;
+            const float R = cx + 11.0f, B = cy + 11.0f;
+            const float A = 7.0f;                       // 角臂长
+            auto Bracket = [&](float x0, float y0, float x1, float y1,
+                               float x2, float y2) {
+                gp::GraphicsPath p;
+                p.AddLine(x0, y0, x1, y1);
+                p.AddLine(x1, y1, x2, y2);
+                gr.DrawPath(&pen, &p);
+            };
+            Bracket(L, T + A, L, T, L + A, T);          // 左上
+            Bracket(R - A, T, R, T, R, T + A);          // 右上
+            Bracket(R, B - A, R, B, R - A, B);          // 右下
+            Bracket(L + A, B, L, B, L, B - A);          // 左下
+
+            gp::Pen thin(ink, 2.6f);
+            thin.SetStartCap(gp::LineCapRound);
+            thin.SetEndCap(gp::LineCapRound);
+            thin.SetLineJoin(gp::LineJoinRound);
+            // 字面 13x13（框内可用区约 14x14）：太小会糊成一团，太大会顶到角臂
+            gr.DrawLine(&thin, gp::PointF(cx + 0.3f, cy - 6.7f),
+                               gp::PointF(cx + 2.1f, cy - 5.1f));      // 点
+            gr.DrawLine(&thin, gp::PointF(cx - 5.8f, cy - 3.0f),
+                               gp::PointF(cx + 5.8f, cy - 3.0f));      // 横
+            gr.DrawLine(&thin, gp::PointF(cx + 0.9f, cy - 3.0f),
+                               gp::PointF(cx - 5.3f, cy + 6.4f));      // 撇
+            gr.DrawLine(&thin, gp::PointF(cx + 0.9f, cy - 3.0f),
+                               gp::PointF(cx + 5.6f, cy + 6.4f));      // 捺
             break;
         }
         case kTbSave: {
@@ -2302,7 +2328,22 @@ static void ReleaseScreenBuffers() {
     g.dim.clear();    g.dim.shrink_to_fit();
 }
 
+// 遮罩/结果窗期间临时关掉"用完即卸"。
+// 理由：用户一次截图里经常要框两次字（先框一大块、再框准一点），而引擎每次
+// Init 要 238ms ——"识别完就卸"会让第二次多付这 238ms。改成遮罩存活期间不卸，
+// 收尾再卸，静默内存照样回到 1~2MB，只是截图那几秒多占约 56MB（用户接受）。
+// 用 RAII：这个函数里有 5 处 return，手工恢复必然漏掉某一条。
+struct OcrKeepAlive {
+    bool prev;
+    OcrKeepAlive() : prev(OcrGetUnloadAfterUse()) { OcrSetUnloadAfterUse(false); }
+    ~OcrKeepAlive() {
+        OcrSetUnloadAfterUse(prev);
+        if (prev) OcrRequestUnload();   // 排队卸载：不打断可能还在跑的识别
+    }
+};
+
 CaptureImage CaptureRegionInteractive() {
+    OcrKeepAlive keepAliveOcr;      // 必须最先构造：后面任何 return 都会恢复策略
     EnsureDpi();
     // 先取虚拟屏幕尺寸，供 EnumWnd 过滤桌面/过大窗口时使用。
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);

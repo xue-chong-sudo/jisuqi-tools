@@ -16,4 +16,4 @@ cd "$PROJ/_probe" || exit 1
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$MSVC/bin/Hostx64/x64/cl.exe" \
   /nologo /O2 /EHsc /utf-8 /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS \
   "$SRC.cpp" /Fe:"$OUT" \
-  /link user32.lib gdi32.lib shell32.lib /SUBSYSTEM:CONSOLE /MACHINE:X64
+  /link user32.lib gdi32.lib psapi.lib shell32.lib /SUBSYSTEM:CONSOLE /MACHINE:X64
