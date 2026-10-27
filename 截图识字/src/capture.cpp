@@ -1510,7 +1510,21 @@ enum {
 };
 static HWND g_tb = nullptr;
 static int  g_tbHot = 0;    // 悬停的按钮
-static int  g_tbPress = 0;  // 已按下尚未松开的按钮
+static int  g_tbPress = 0;  // 按下的按钮（0 = 空白处/没有）
+// ---- 长按拖动（用户："长按工具框是可以拖动的"）----
+// 判定链：按下 → 起 300ms 定时器 → 到点还按着就转拖动；提前松开且几乎没动 = 点击。
+// 拖动只 SetWindowPos，绝不动 g.bits、也不调 Redraw()：工具栏是独立窗口，
+// 重画遮罩只会让整块选区白闪一帧。
+static bool  g_tbPressDown = false;   // 已按下、尚未松开
+static bool  g_tbArmed     = false;   // 已进入"拖动"（长按到点 或 位移超过阈值）
+static bool  g_tbDrag      = false;   // 正在拖动中
+static bool  g_tbUserMoved = false;   // 用户手动拖过 → TbReposition() 不再抢回选区下方
+static POINT g_tbDownPt{ 0, 0 };      // 按下点（工具栏客户区坐标）
+static POINT g_tbDragPt{ 0, 0 };      // 拖动锚点（屏幕坐标）
+static POINT g_tbDragPos{ 0, 0 };     // 拖动开始时窗口左上角
+static const UINT_PTR kTbDragTimer  = 2;
+static const int      kTbDragDelayMs = 300;   // 长按 0.3 秒转拖动
+static const int      kTbDragSlop    = 4;     // 位移 <= 4px 仍算点击
 static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l);  // TbCreate 需要
 
 static RECT TbButtonRect(int id) {
@@ -1711,9 +1725,38 @@ static void TbCommand(int id) {
     FinishAdjust(id);                                // 其余（关闭等）按老路收尾
 }
 
+// 把工具栏钳进当前显示器的工作区（拖动用，边距 8）
+static void TbClampToWork() {
+    if (!g_tb) return;
+    RECT wr; GetWindowRect(g_tb, &wr);
+    HMONITOR hm = MonitorFromWindow(g_tb, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    RECT wa;
+    if (GetMonitorInfo(hm, &mi)) wa = mi.rcWork;
+    else wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    const int w = (int)(wr.right - wr.left), h = (int)(wr.bottom - wr.top);
+    const int x = std::max((int)wa.left + 8, std::min((int)wr.left,  (int)wa.right  - 8 - w));
+    const int y = std::max((int)wa.top  + 8, std::min((int)wr.top,   (int)wa.bottom - 8 - h));
+    if (x != wr.left || y != wr.top)
+        SetWindowPos(g_tb, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// 以"按下点"为锚进入拖动：锚点用屏幕坐标记一次，之后只比绝对位移，不会累积漂移。
+static void TbBeginDrag() {
+    if (!g_tb || g_tbDrag) return;
+    RECT wr; GetWindowRect(g_tb, &wr);
+    g_tbDragPos = { wr.left, wr.top };
+    g_tbDragPt  = { wr.left + g_tbDownPt.x, wr.top + g_tbDownPt.y };
+    g_tbArmed = true;
+    g_tbDrag  = true;
+    SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+}
+
 // 工具栏跟随选区：优先贴在选区正下方居中，下方放不下改上方，再钳回工作区。
+// 用户手动拖过之后就不再跟随（否则"拖到别处、一动选区又跳回来"，等于白拖）。
 static void TbReposition() {
     if (!g_tb) return;
+    if (g_tbUserMoved) return;
     RECT s = g.sel;
     HMONITOR hm = MonitorFromRect(&s, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{ sizeof(mi) };
@@ -1752,6 +1795,11 @@ static void TbCreate() {
     SetWindowRgn(g_tb, CreateRoundRectRgn(0, 0, kTbW + 1, kTbH + 1, 20, 20), FALSE);
     g_tbHot = 0;
     g_tbPress = 0;
+    // 新一轮截图：一切拖动状态归零，工具栏重新跟随选区
+    g_tbPressDown = false;
+    g_tbArmed = false;
+    g_tbDrag = false;
+    g_tbUserMoved = false;
     TbReposition();
     ShowWindow(g_tb, SW_SHOWNOACTIVATE);
 }
@@ -1859,7 +1907,12 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             // FontFamily 必须先于 Font 构造、晚于 Font 析构（/permissive 下不能对
             // 临时对象取地址），所以两个都提成 static。
             static gp::FontFamily ffText(L"Microsoft YaHei");
-            static gp::Font fText(&ffText, 13, gp::FontStyleRegular, gp::UnitPixel);
+            // 用户："'文'不在整个框的中央，稍微加粗一点点，然后向左向下一点点"。
+            // 加粗用 FontStyleBold（13px 下 Regular→Bold 大约每笔厚 0.5~1px，
+            // 正好是"一点点"；再大就该改字号了）。位置偏移也做成常量，方便再微调。
+            static gp::Font fText(&ffText, 13, gp::FontStyleBold, gp::UnitPixel);
+            const float kTextDx = -1.0f;    // 负=左移
+            const float kTextDy = +1.0f;    // 正=下移
             gr.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
             gp::SolidBrush tb(ink);
             gp::StringFormat sf;
@@ -1869,8 +1922,8 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             gr.MeasureString(L"文", 1, &fText, gp::PointF(0.f, 0.f), &sf, &meas);
             // MeasureString 的结果带字面留白，按它自己的 X/Y 偏移做光学居中
             gr.DrawString(L"文", -1, &fText,
-                          gp::PointF(cx - meas.Width / 2 - meas.X,
-                                     cy - meas.Height / 2 - meas.Y), &sf, &tb);
+                          gp::PointF(cx + kTextDx - meas.Width / 2 - meas.X,
+                                     cy + kTextDy - meas.Height / 2 - meas.Y), &sf, &tb);
             break;
         }
         case kTbSave: {
@@ -1938,7 +1991,7 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 for (int id = kTbRect; id <= kTbSave; ++id) {
                     RECT r = TbButtonRect(id);
                     const bool hover   = (g_tbHot == id);
-                    const bool pressed = (g_tbPress == id);
+                    const bool pressed = (g_tbPressDown && !g_tbArmed && g_tbPress == id);
                     const bool active  = (id <= kTbText) && (g.annTool == AT_RECT + (id - kTbRect));
                     // 保存键**没有**常驻底色了（用户："下载为什么默认有蓝色的背景色块？去掉"），
                     // 只有 hover/press 才画底，和工具按钮走同一套。
@@ -2010,6 +2063,29 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_MOUSEMOVE: {
             POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            if (g_tbDrag) {
+                // 拖动态：用**绝对光标位置**算位移，不用 lParam。原因：
+                // 拖动中每帧都在 SetWindowPos，Windows 会因窗口移动补发一批
+                // WM_MOUSEMOVE，那些合成消息的客户区坐标相对的是移动后的窗口，
+                // 拿它算增量会一路放大（实测第一帧 (86,668)、第二帧直接跳到 (1099,477)）。
+                // GetCursorPos 是绝对坐标，合成消息和真实消息报的是同一个点，天然免疫。
+                POINT sp; GetCursorPos(&sp);
+                SetWindowPos(h, NULL,
+                             g_tbDragPos.x + sp.x - g_tbDragPt.x,
+                             g_tbDragPos.y + sp.y - g_tbDragPt.y,
+                             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                TbClampToWork();
+                return 0;
+            }
+            if (g_tbPressDown && !g_tbArmed) {
+                // 还没到 300ms 就拉了超过阈值 —— 当拖动处理（否则快速拖动会变成"点一下"）
+                POINT sp; GetCursorPos(&sp);
+                if (std::abs(sp.x - g_tbDragPt.x) > kTbDragSlop ||
+                    std::abs(sp.y - g_tbDragPt.y) > kTbDragSlop) {
+                    TbBeginDrag();
+                    return 0;
+                }
+            }
             int hit = TbHitTest(pt);
             if (hit != g_tbHot) { g_tbHot = hit; InvalidateRect(h, NULL, FALSE); }
             return 0;
@@ -2017,24 +2093,63 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDOWN: {
             POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
             g_tbPress = TbHitTest(pt);
+            g_tbDownPt = pt;
+            // 先把锚点记下来：WM_MOUSEMOVE 判"位移超过 4px"要用它，
+            // 那时 g_tbDragPos/g_tbDragPt 还是上一轮的值（甚至是 0）。
+            {
+                RECT wr; GetWindowRect(h, &wr);
+                g_tbDragPos = { wr.left, wr.top };
+                g_tbDragPt  = { wr.left + pt.x, wr.top + pt.y };
+            }
+            g_tbPressDown = true;
+            g_tbArmed = false;
+            g_tbDrag = false;
             SetCapture(h);
+            SetTimer(h, kTbDragTimer, (UINT)kTbDragDelayMs, NULL);   // 长按判定
             InvalidateRect(h, NULL, FALSE);
             return 0;
         }
+        case WM_TIMER:
+            if (w == kTbDragTimer) {
+                KillTimer(h, kTbDragTimer);
+                if (g_tbPressDown && !g_tbArmed) TbBeginDrag();   // 按满 300ms → 转拖动
+            }
+            return 0;
         case WM_LBUTTONUP: {
             POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
             int hit = TbHitTest(pt);
             int press = g_tbPress;
-            g_tbPress = 0;
+            // 先取状态再收尾：ReleaseCapture() 会同步发 WM_CAPTURECHANGED，
+            // 那里会把 g_tbPressDown/g_tbDrag 清掉（view.cpp 同款坑，注释也抄过来了）
+            const bool wasDrag  = g_tbDrag;
+            const bool wasPress = g_tbPressDown && !g_tbArmed;
+            KillTimer(h, kTbDragTimer);
             ReleaseCapture();
+            g_tbPressDown = false;
+            g_tbArmed = false;
+            g_tbDrag = false;
+            g_tbPress = 0;
+            SetCursor(LoadCursor(NULL, IDC_ARROW));
             InvalidateRect(h, NULL, FALSE);
-            if (press != 0 && press == hit) {
+            if (wasDrag) {
+                g_tbUserMoved = true;      // 拖过就别再自动跟回选区
+            } else if (wasPress && press != 0 && press == hit) {
                 TbCommand(press);
                 // 选工具/颜色/粗细后要刷新按钮状态；收尾路径已经把 g_tb 销毁了
                 if (g_tb) InvalidateRect(g_tb, NULL, FALSE);
             }
             return 0;
         }
+        case WM_CAPTURECHANGED:
+            // 焦点/捕获被抢走（比如弹了另存为对话框）：把拖动状态清干净，别留半个拖动态
+            if ((HWND)l != h) {
+                KillTimer(h, kTbDragTimer);
+                g_tbPressDown = false;
+                g_tbArmed = false;
+                g_tbDrag = false;
+                g_tbPress = 0;
+            }
+            return 0;
         case WM_MOUSEACTIVATE:
             // 点击不抢焦点：焦点留在遮罩上，ESC / 方向键始终归遮罩
             return MA_NOACTIVATE;
