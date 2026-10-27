@@ -1933,7 +1933,7 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             // 用户："'文'不在整个框的中央，稍微加粗一点点，然后向左向下一点点"。
             // 加粗用 FontStyleBold（13px 下 Regular→Bold 大约每笔厚 0.5~1px，
             // 正好是"一点点"；再大就该改字号了）。位置偏移也做成常量，方便再微调。
-            static gp::Font fText(&ffText, 13, gp::FontStyleBold, gp::UnitPixel);
+            static gp::Font fText(&ffText, 14, gp::FontStyleBold, gp::UnitPixel);
             const float kTextDx = +1.0f;    // 负=左移（用户要右移 2px，故从 -1 改 +1）
             const float kTextDy = +1.0f;    // 正=下移
             gr.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
