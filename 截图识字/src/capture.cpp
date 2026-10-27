@@ -1622,7 +1622,6 @@ static void FinishAdjust(int action) {
 // 目录记在 shot_ui.ini 的 [save] lastdir，和颜色/粗细同一份文件（不碰 settings.ini）。
 static std::wstring g_savePath;       // 用户确认后的目标路径
 static bool         g_saveToFile = false;  // 这次截图要写文件（尾部按它分流）
-static bool         g_copyTextOnly = false; // 右键菜单/Ctrl+C：只要文字，不要图
 
 static std::wstring LoadLastSaveDir() {
     const std::wstring p = ShotUiIni();
@@ -2240,7 +2239,7 @@ static void ShowCopyToast(const wchar_t* msg) {
     // 量文字宽度定窗宽（+48 给左右留白）。MeasureString 需要一个活着的 Graphics，
     // 用 1x1 的探针位图；不能对临时 Bitmap 取地址（/permissive 下 C2102）。
     gp::FontFamily ff(L"Microsoft YaHei");
-    gp::Font f(&ff, 15, gp::FontStyleRegular, gp::UnitPixel);
+    gp::Font f(&ff, 14, gp::FontStyleRegular, gp::UnitPixel);
     gp::Bitmap probe(1, 1, PixelFormat32bppPARGB);
     gp::Graphics tmp(&probe);
     gp::RectF meas;
@@ -2248,8 +2247,8 @@ static void ShowCopyToast(const wchar_t* msg) {
     sf.SetAlignment(gp::StringAlignmentCenter);
     sf.SetLineAlignment(gp::StringAlignmentCenter);
     tmp.MeasureString(msg, -1, &f, gp::PointF(0, 0), &sf, &meas);
-    const int tw = (int)std::ceil(meas.Width) + 48;
-    const int th = 44;
+    const int tw = (int)std::ceil(meas.Width) + 32;
+    const int th = 40;
 
     POINT cur{ 0, 0 };
     GetCursorPos(&cur);
@@ -2285,8 +2284,8 @@ static void ShowCopyToast(const wchar_t* msg) {
             g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
             g.Clear(gp::Color(0, 0, 0, 0));
             gp::GraphicsPath path;
-            TbRoundPath(path, gp::RectF(0.5f, 0.5f, (float)tw - 1, (float)th - 1), 8.0f);
-            gp::SolidBrush bg(gp::Color(235, 32, 32, 36));
+            TbRoundPath(path, gp::RectF(0.5f, 0.5f, (float)tw - 1, (float)th - 1), 12.0f);
+            gp::SolidBrush bg(gp::Color(240, 28, 28, 30));
             g.FillPath(&bg, &path);
             gp::SolidBrush fg(gp::Color(255, 255, 255, 255));
             g.DrawString(msg, -1, &f, gp::RectF(0, 0, (float)tw, (float)th), &sf, &fg);
@@ -2302,7 +2301,16 @@ static void ShowCopyToast(const wchar_t* msg) {
     ReleaseDC(nullptr, screen);
 
     ShowWindow(h, SW_SHOWNOACTIVATE);
-    SetTimer(h, 1, 2000, nullptr);        // 2 秒后自己 DestroyWindow
+    SetTimer(h, 1, 1500, nullptr);        // 1.5 秒后自己 DestroyWindow
+}
+
+// 复制当前选中的文字并提示（菜单「复制文字」与 Ctrl+C 共用）。
+// 刻意**不结束截图**：用户要求"弹窗时仅提示，别把截图关了"，
+// 复制完还能接着改选区、再框一次、或按 ESC 收尾。
+static void CopyPickedTextAndToast() {
+    const std::string picked = PickedTextUtf8();
+    if (picked.empty()) return;
+    if (CopyUtf8ToClipboard(picked)) ShowCopyToast(L"文字已复制到剪贴板");
 }
 
 static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2527,13 +2535,21 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g.phase == Phase::Adjust && !g.words.empty()) {
                 POINT pt{ GET_X_LPARAM(l) + g.vx, GET_Y_LPARAM(l) + g.vy };
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, 1, L"&1 复制文字");
-                AppendMenuW(menu, MF_STRING, 2, L"&2 关闭");
+                AppendMenuW(menu, MF_STRING, 1, L"复制文字");
+                AppendMenuW(menu, MF_STRING, 2, L"关闭");
+                // 去掉左侧"勾选列"：原生菜单默认按 SM_CXMENUCHECK 预留一条空白，
+                // 看着左右边距特别大。MNS_NOCHECK 不预留，边距就是托盘右键那种紧凑感。
+                MENUINFO mi{};
+                mi.cbSize = sizeof(mi);
+                mi.fMask  = MIM_STYLE;
+                mi.dwStyle = MNS_NOCHECK;
+                SetMenuInfo(menu, &mi);
                 SetForegroundWindow(h);          // 否则点击菜单外部时菜单不会消失
                 const int cmd = TrackPopupMenu(menu,
                     TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
                 DestroyMenu(menu);
-                if (cmd == 1) { g_copyTextOnly = true; FinishAdjust(kTbSave); }
+                // 复制文字**不关**截图（用户：弹窗时仅提示，别把截图关了）
+                if (cmd == 1) { CopyPickedTextAndToast(); }
                 else if (cmd == 2) { FinishAdjust(false); }
                 break;
             }
@@ -2553,7 +2569,7 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (w == VK_RETURN && g.phase == Phase::Adjust) { FinishAdjust(kTbSave); break; }
             // Ctrl+C 复制文字（调整态）：与右键菜单「复制文字」同一条路
             if (g.phase == Phase::Adjust && w == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                if (!g.words.empty()) { g_copyTextOnly = true; FinishAdjust(kTbSave); }
+                CopyPickedTextAndToast();      // 同样只复制 + 提示，不关窗
                 break;
             }
             // Ctrl+Z 撤销最后一笔标注（只在调整态有意义）
@@ -2656,7 +2672,6 @@ CaptureImage CaptureRegionInteractive() {
     // 「下载」的目标路径是"这一次截图"的临时状态，必须每轮清掉：
     // 否则上一轮存过的文件会一直挂着，下次点 ESC 保存也会跟着写一遍同一个路径。
     g_saveToFile = false;
-    g_copyTextOnly = false;
     g_savePath.clear();
     // 上一轮可能还有识别在跑（用户在识别完成前就保存/取消了）。作废它，
     // 并清掉暂存区，免得旧词表漏到这一轮的画面上。
@@ -2854,11 +2869,7 @@ CaptureImage CaptureRegionInteractive() {
     // 就是用户看到的成品，不要再画一遍）。这条必须排在最前，否则会被"有选中词"
     // 或"saveToClip"抢走。
     std::string picked = PickedTextUtf8();
-    if (g_copyTextOnly) {
-        // 右键「复制文字」/ Ctrl+C：只写文字，不写图，然后给 2 秒提示。
-        g_shotCopied = true;
-        if (CopyUtf8ToClipboard(picked)) ShowCopyToast(L"文字已复制到剪贴板");
-    } else if (g_saveToFile && !g_savePath.empty()) {
+    if (g_saveToFile && !g_savePath.empty()) {
         g_shotCopied = true;                 // 已经给了用户结果，不用再弹旧结果窗
         SaveImageToFile(out, g_savePath);
     } else if (!picked.empty()) {

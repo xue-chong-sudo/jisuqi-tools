@@ -138,15 +138,16 @@ static bool RunOnce(DWORD pid, UINT trig, HWND host, int item,
 
     // 必须用**真鼠标点**：菜单项的选中由菜单自己的模态循环处理，投递 WM_KEYDOWN
     // 给它没用（实测选不中）。先取菜单项矩形，再把光标挪到它中间点一下。
+    // 直接按"两项均分"算点：menu 是菜单**窗口**句柄（HWND），GetMenuItemRect 要的是
+    // HMENU，拿不到；均分足够（实测点得中）。
+    RECT mr{}; GetWindowRect(menu, &mr);
     RECT ir{};
-    if (!GetMenuItemRect(nullptr, menu, (UINT)(item - 1), &ir)) {
-        RECT mr{}; GetWindowRect(menu, &mr);          // 兜底：按两项均分
+    {
         const int ih = (mr.bottom - mr.top) / 2;
         ir.left = mr.left; ir.right = mr.right;
         ir.top = mr.top + (item - 1) * ih;
         ir.bottom = ir.top + ih;
     }
-    RECT mr{}; GetWindowRect(menu, &mr);
     printf("[drv10]      菜单 (%ld,%ld)-(%ld,%ld) 项%d (%ld,%ld)-(%ld,%ld)\n",
            mr.left, mr.top, mr.right, mr.bottom, item,
            ir.left, ir.top, ir.right, ir.bottom);
@@ -179,16 +180,27 @@ int main() {
     Check(hasText, "① 复制文字后剪贴板里有文字");
     Check(!ClipHasDib(), "① 只要了文字，没有把图也塞进去");
 
+    // 新要求：复制文字**不关**截图
+    Check(FindByClass(kMaskClass, pid) != nullptr, "① 复制文字后遮罩仍在（只提示不关窗）");
+
     HWND toast = FindByClass(kToastClass, pid);
     Check(toast != nullptr, "① 出现「文字已复制到剪贴板」提示窗");
     if (toast) {
         RECT r{}; GetWindowRect(toast, &r);
         printf("[drv10]      提示窗 (%ld,%ld)-(%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
     }
-    Sleep(2400);
-    Check(FindByClass(kToastClass, pid) == nullptr, "① 提示窗约 2 秒后自己消失");
+    Sleep(1900);
+    Check(FindByClass(kToastClass, pid) == nullptr, "① 提示窗约 1.5 秒后自己消失");
 
     // ---------- ② 关闭 ----------
+    // 先把还开着的遮罩用 ESC 收掉（复制不再关窗了）
+    if (HWND m2 = FindByClass(kMaskClass, pid)) {
+        POINT o2{ 0, 0 };
+        ClientToScreen(m2, &o2);
+        SendMessage(m2, WM_KEYDOWN, VK_ESCAPE, 0);
+        SendMessage(m2, WM_KEYUP, VK_ESCAPE, 0);
+        Sleep(700);
+    }
     if (OpenClipboard(nullptr)) { EmptyClipboard(); CloseClipboard(); }
     Sleep(300);
     bool seen2 = false;
