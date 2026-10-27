@@ -2219,13 +2219,53 @@ static bool CopyUtf8ToClipboard(const std::string& utf8) {
     return ok;
 }
 
+// 提示条的动画状态：位图常驻在窗口上，淡入淡出只是改 SourceConstantAlpha，
+// 不用每帧重画。
+struct ToastState {
+    HDC     mem = nullptr;
+    HBITMAP hbm = nullptr;
+    SIZE    sz{ 0, 0 };
+    DWORD   t0 = 0;          // 出现时刻
+    bool    fadingOut = false;
+};
+
 static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_TIMER) { DestroyWindow(h); return 0; }
-    if (m == WM_DESTROY) { KillTimer(h, 1); return 0; }
+    auto* st = reinterpret_cast<ToastState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    switch (m) {
+        case WM_TIMER: {
+            if (!st) { DestroyWindow(h); return 0; }
+            const DWORD el = GetTickCount() - st->t0;
+            // 150ms 淡入 → 显示到 1500ms → 150ms 淡出 → 销毁
+            int a = 255;
+            if (el < 150) a = (int)(255 * el / 150);
+            else if (el >= 1500) {
+                const DWORD fo = el - 1500;
+                if (fo >= 150) { DestroyWindow(h); return 0; }
+                a = 255 - (int)(255 * fo / 150);
+            }
+            HDC screen = GetDC(nullptr);
+            BLENDFUNCTION bf{ AC_SRC_OVER, 0, (BYTE)a, AC_SRC_ALPHA };
+            POINT src{ 0, 0 };
+            UpdateLayeredWindow(h, screen, nullptr, &st->sz, st->mem, &src, 0, &bf, ULW_ALPHA);
+            ReleaseDC(nullptr, screen);
+            return 0;
+        }
+        case WM_DESTROY: {
+            KillTimer(h, 1);
+            if (st) {
+                if (st->hbm) DeleteObject(st->hbm);
+                if (st->mem) DeleteDC(st->mem);
+                delete st;
+                SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            }
+            return 0;
+        }
+    }
     return DefWindowProcW(h, m, w, l);
 }
 
-// 在"鼠标所在显示器"的中下（约 68% 高）弹一条提示，2 秒后自己消失。
+// 底部居中的胶囊提示：半透明深色底 + 白色文字 + 柔和投影，150ms 淡入淡出。
+// 位置在**工作区**底部上方 80px（避开任务栏），不用屏幕矩形是为了不压到任务栏。
 static void ShowCopyToast(const wchar_t* msg) {
     static bool reg = false;
     if (!reg) {
@@ -2236,10 +2276,9 @@ static void ShowCopyToast(const wchar_t* msg) {
         RegisterClassW(&wc);
         reg = true;
     }
-    // 量文字宽度定窗宽（+48 给左右留白）。MeasureString 需要一个活着的 Graphics，
-    // 用 1x1 的探针位图；不能对临时 Bitmap 取地址（/permissive 下 C2102）。
+    // 量文字定宽。字号 18（用户要在原 14 的基础上 +4px）。
     gp::FontFamily ff(L"Microsoft YaHei");
-    gp::Font f(&ff, 14, gp::FontStyleRegular, gp::UnitPixel);
+    gp::Font f(&ff, 18, gp::FontStyleRegular, gp::UnitPixel);
     gp::Bitmap probe(1, 1, PixelFormat32bppPARGB);
     gp::Graphics tmp(&probe);
     gp::RectF meas;
@@ -2247,15 +2286,17 @@ static void ShowCopyToast(const wchar_t* msg) {
     sf.SetAlignment(gp::StringAlignmentCenter);
     sf.SetLineAlignment(gp::StringAlignmentCenter);
     tmp.MeasureString(msg, -1, &f, gp::PointF(0, 0), &sf, &meas);
-    const int tw = (int)std::ceil(meas.Width) + 32;
-    const int th = 40;
+
+    const int tw = (int)std::ceil(meas.Width) + 40;   // 左右各 20
+    const int th = 38;                                // 胶囊高
+    const float rad = th / 2.0f;                      // 半高圆角 = 正胶囊
 
     POINT cur{ 0, 0 };
     GetCursorPos(&cur);
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST), &mi);
-    const int x = (mi.rcMonitor.left + mi.rcMonitor.right) / 2 - tw / 2;
-    const int y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top) * 68 / 100;
+    const int x = (mi.rcWork.left + mi.rcWork.right) / 2 - tw / 2;
+    const int y = mi.rcWork.bottom - 80 - th;         // 距工作区底 80px
 
     HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
                              WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
@@ -2263,11 +2304,10 @@ static void ShowCopyToast(const wchar_t* msg) {
                              nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!h) return;
 
-    // 32bpp 预乘 alpha 的 DIB，用 GDI+ 画圆角底 + 白字，再整块交给 UpdateLayeredWindow
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = tw;
-    bi.bmiHeader.biHeight = -th;          // top-down
+    bi.bmiHeader.biHeight = -th;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -2275,33 +2315,54 @@ static void ShowCopyToast(const wchar_t* msg) {
     void* bits = nullptr;
     HBITMAP hbm = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HDC mem = CreateCompatibleDC(screen);
-    if (hbm && bits && mem) {
-        HGDIOBJ ob = SelectObject(mem, hbm);
-        {
-            gp::Bitmap bmp(tw, th, tw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
-            gp::Graphics g(&bmp);
-            g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
-            g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
-            g.Clear(gp::Color(0, 0, 0, 0));
-            gp::GraphicsPath path;
-            TbRoundPath(path, gp::RectF(0.5f, 0.5f, (float)tw - 1, (float)th - 1), 12.0f);
-            gp::SolidBrush bg(gp::Color(240, 28, 28, 30));
-            g.FillPath(&bg, &path);
-            gp::SolidBrush fg(gp::Color(255, 255, 255, 255));
-            g.DrawString(msg, -1, &f, gp::RectF(0, 0, (float)tw, (float)th), &sf, &fg);
-        }
-        POINT src{ 0, 0 };
-        SIZE sz{ tw, th };
-        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        UpdateLayeredWindow(h, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
-        SelectObject(mem, ob);
-    }
-    if (hbm) DeleteObject(hbm);
-    if (mem) DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+    if (!hbm || !bits || !mem) {
+        if (hbm) DeleteObject(hbm);
+        if (mem) DeleteDC(mem);
+        DestroyWindow(h);
+        return;
+    }
+    HGDIOBJ ob = SelectObject(mem, hbm);
+    {
+        gp::Bitmap bmp(tw, th, tw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        gp::Graphics g(&bmp);
+        g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
+        g.Clear(gp::Color(0, 0, 0, 0));
 
+        // 柔和投影：从外到内画几层低透明度胶囊，越外越淡（比真高斯便宜得多，
+        // 也不依赖 DWM 给分层窗加阴影——那条路对 ULW 窗口不可靠）。
+        for (int i = 5; i >= 1; --i) {
+            const float d = (float)i * 1.6f;
+            gp::GraphicsPath sh;
+            TbRoundPath(sh, gp::RectF(d, d + 2.0f, (float)tw - 2 * d, (float)th - 2 * d), rad);
+            gp::SolidBrush sb(gp::Color(10, 0, 0, 0));
+            g.FillPath(&sb, &sh);
+        }
+        // 胶囊本体 rgba(0,0,0,0.75)
+        gp::GraphicsPath path;
+        TbRoundPath(path, gp::RectF(0.5f, 0.5f, (float)tw - 1, (float)th - 1), rad);
+        gp::SolidBrush bg(gp::Color(191, 0, 0, 0));
+        g.FillPath(&bg, &path);
+        gp::SolidBrush fg(gp::Color(255, 255, 255, 255));
+        g.DrawString(msg, -1, &f, gp::RectF(0, 0, (float)tw, (float)th), &sf, &fg);
+    }
+
+    auto* st = new ToastState;
+    st->mem = mem;
+    st->hbm = hbm;
+    st->sz = SIZE{ tw, th };
+    st->t0 = GetTickCount();
+    SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(st));
+    SelectObject(mem, ob);          // 位图已画完，DIB 归 st 管理
+
+    HDC screen2 = GetDC(nullptr);
+    BLENDFUNCTION bf0{ AC_SRC_OVER, 0, 0, AC_SRC_ALPHA };   // 从全透明开始淡入
+    POINT src{ 0, 0 };
+    UpdateLayeredWindow(h, screen2, nullptr, &st->sz, mem, &src, 0, &bf0, ULW_ALPHA);
+    ReleaseDC(nullptr, screen2);
     ShowWindow(h, SW_SHOWNOACTIVATE);
-    SetTimer(h, 1, 1500, nullptr);        // 1.5 秒后自己 DestroyWindow
+    SetTimer(h, 1, 15, nullptr);    // 15ms 一帧驱动淡入淡出
 }
 
 // 复制当前选中的文字并提示（菜单「复制文字」与 Ctrl+C 共用）。
@@ -2310,7 +2371,7 @@ static void ShowCopyToast(const wchar_t* msg) {
 static void CopyPickedTextAndToast() {
     const std::string picked = PickedTextUtf8();
     if (picked.empty()) return;
-    if (CopyUtf8ToClipboard(picked)) ShowCopyToast(L"文字已复制到剪贴板");
+    if (CopyUtf8ToClipboard(picked)) ShowCopyToast(L"已复制");
 }
 
 static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2875,7 +2936,7 @@ CaptureImage CaptureRegionInteractive() {
     } else if (!picked.empty()) {
         g_shotCopied = true;
         ShotCopyImageThenText(out, picked);
-        ShowCopyToast(L"文字已复制到剪贴板");
+        ShowCopyToast(L"已复制");
     } else if (g.ocrWanted) {         // 兜底：整块识别（工具栏上已无此按钮，留着不删）
         g_shotCopied = true;
         ShotOcrAndCopy(out);          // 内部：先写图、再跑 OCR、再写文字
