@@ -1139,9 +1139,9 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_KEYDOWN:
-            // Requirement 1: no shortcuts work on the main panel. Shortcuts
-            // (F2/G/D/N for the icon menu, N/F2/D for the group menu) are only
-            // active while the corresponding context menu is open.
+            // 主面板上的裸键有意义：字母 = 一键启动（未绑定则落进搜索框）、
+            // 数字 1..9 = 切分组（见下面）。而 F2/G/D/N 这类**菜单快捷键**只在
+            // 对应右键菜单打开时才生效（由键盘钩子 + MenuKeyAction 处理）。
             if (wp == VK_ESCAPE) {
                 if (m_editRename) CancelRename();
                 else if (m_openDrawer >= 0) CloseDrawer();
@@ -1157,6 +1157,22 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             // 搜索框快捷键（不带 Alt 的组合，例如 Ctrl+F）：把焦点送进搜索框
             if (MatchSearchBoxHotkey(wp)) {
                 if (m_editSearch) SetFocus(m_editSearch);
+                return 0;
+            }
+            // 数字键 1..9：直接切到第 N 个分组（按分组在配置里的顺序，内部序号，
+            // **不显示在标签上** —— 用户要的就是这种"暗号"式快捷键）。
+            //
+            // 为什么能用裸数字：主窗口刻意把焦点留给自己而不是搜索框（见上面
+            // ForceForeground 那段注释），字母键就是这么当"一键启动"用的。
+            // 用户确认的规则："聚焦搜索的时候输入才是搜索；没聚焦搜索，数字就是
+            // 快捷键"—— 搜索框有焦点时按键进 EDIT，根本走不到这里，天然满足。
+            //
+            // 分组不足 N 个时**吞掉但不做事**：不落到搜索框（否则按 5 会莫名多出
+            // 个 "5" 把列表筛空），也不误触发别的动作。
+            if (wp >= '1' && wp <= '9') {
+                const int gi = static_cast<int>(wp - '1');
+                if (gi < static_cast<int>(m_app->GetConfig().groups.size()))
+                    SetCurrentGroup(gi);
                 return 0;
             }
             // 字母键：命中已绑定图标 -> 直接启动（LaunchItem 内部会隐藏面板）；
