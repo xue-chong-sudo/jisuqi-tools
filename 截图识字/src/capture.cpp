@@ -1834,8 +1834,7 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             // 微信「文字识别」同款：四角取景框 + 中间一个「文」。
             // 用户原话："文字识别能不能按照微信这个设计，一模一样就行"。
             // 取景框四个角是"圆头圆角的 L"：用三点路径 + 圆头圆角画，拐角自然带
-            // 圆弧，不用另外拼 AddArc。中心「文」用同一支笔的缩小版（笔画更细一档，
-            // 否则 11px 见方的字四笔会并成一团）。
+            // 圆弧，不用另外拼 AddArc。中心「文」的取法见下面那段注释（用字体）。
             const float L = cx - 11.0f, T = cy - 11.0f;
             const float R = cx + 11.0f, B = cy + 11.0f;
             const float A = 7.0f;                       // 角臂长
@@ -1851,19 +1850,27 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             Bracket(R, B - A, R, B, R - A, B);          // 右下
             Bracket(L + A, B, L, B, L, B - A);          // 左下
 
-            gp::Pen thin(ink, 2.6f);
-            thin.SetStartCap(gp::LineCapRound);
-            thin.SetEndCap(gp::LineCapRound);
-            thin.SetLineJoin(gp::LineJoinRound);
-            // 字面 13x13（框内可用区约 14x14）：太小会糊成一团，太大会顶到角臂
-            gr.DrawLine(&thin, gp::PointF(cx + 0.3f, cy - 6.7f),
-                               gp::PointF(cx + 2.1f, cy - 5.1f));      // 点
-            gr.DrawLine(&thin, gp::PointF(cx - 5.8f, cy - 3.0f),
-                               gp::PointF(cx + 5.8f, cy - 3.0f));      // 横
-            gr.DrawLine(&thin, gp::PointF(cx + 0.9f, cy - 3.0f),
-                               gp::PointF(cx - 5.3f, cy + 6.4f));      // 撇
-            gr.DrawLine(&thin, gp::PointF(cx + 0.9f, cy - 3.0f),
-                               gp::PointF(cx + 5.6f, cy + 6.4f));      // 捺
+            // 中心「文」**用字体**，不手画。
+            // 上一版我用 3.2/2.6px 的线手画四笔，在 13px 见方里四笔交叉成一颗星，
+            // 用户直接说"怎么这么丑"。参考图里那个「文」本来就是印刷体字形——
+            // 字形靠的是笔画的粗细对比和留白，手画等粗线恰好把它抹掉了。
+            // 早前抱怨"字体丑"是因为当时用 26px 撑满整个按钮；13px 缩在取景框里
+            // 就没有那个问题。
+            // FontFamily 必须先于 Font 构造、晚于 Font 析构（/permissive 下不能对
+            // 临时对象取地址），所以两个都提成 static。
+            static gp::FontFamily ffText(L"Microsoft YaHei");
+            static gp::Font fText(&ffText, 13, gp::FontStyleRegular, gp::UnitPixel);
+            gr.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
+            gp::SolidBrush tb(ink);
+            gp::StringFormat sf;
+            sf.SetAlignment(gp::StringAlignmentCenter);
+            sf.SetLineAlignment(gp::StringAlignmentCenter);
+            gp::RectF meas;
+            gr.MeasureString(L"文", 1, &fText, gp::PointF(0.f, 0.f), &sf, &meas);
+            // MeasureString 的结果带字面留白，按它自己的 X/Y 偏移做光学居中
+            gr.DrawString(L"文", -1, &fText,
+                          gp::PointF(cx - meas.Width / 2 - meas.X,
+                                     cy - meas.Height / 2 - meas.Y), &sf, &tb);
             break;
         }
         case kTbSave: {
