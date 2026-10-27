@@ -737,6 +737,9 @@ static int HitHandle(POINT p) {
 // 交换后必须把 dragHandle 重新映射到几何上同一个角/边，否则接下来拖的是错误那条边。
 static void ApplyHandleDrag(POINT p) {
     if (g.dragHandle < 0) return;
+    // 把手拖到窗口/屏幕边也要吸附。用户反馈"鼠标挪到边上依旧不吸附"，就是这条路
+    // 之前完全没调 Snap —— 只有拖框那两处调了，拖把手（调整态）一直是裸坐标。
+    Snap(p);
     int i = g.dragHandle;
     switch (i) {
         case 0: g.sel.left = p.x;  g.sel.top = p.y;    break;
@@ -1931,7 +1934,7 @@ static void TbDrawIcon(gp::Graphics& gr, int id, float cx, float cy,
             // 加粗用 FontStyleBold（13px 下 Regular→Bold 大约每笔厚 0.5~1px，
             // 正好是"一点点"；再大就该改字号了）。位置偏移也做成常量，方便再微调。
             static gp::Font fText(&ffText, 13, gp::FontStyleBold, gp::UnitPixel);
-            const float kTextDx = -1.0f;    // 负=左移
+            const float kTextDx = +1.0f;    // 负=左移（用户要右移 2px，故从 -1 改 +1）
             const float kTextDy = +1.0f;    // 正=下移
             gr.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
             gp::SolidBrush tb(ink);

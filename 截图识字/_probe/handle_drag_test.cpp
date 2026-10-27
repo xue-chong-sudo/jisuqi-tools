@@ -43,6 +43,31 @@ static void ResetSel(int l, int t, int r, int b) {
     g.sel = { l, t, r, b };
 }
 
+
+// 把手拖到屏幕边必须吸附（用户："鼠标挪到边上依旧不吸附"—— 调整态拖把手
+// 这条路径之前完全没调 Snap()，只有拖框那两处调了）。
+static void CheckHandleSnap() {
+    // Snap 的兜底用的是**真实显示器**矩形（MonitorFromPoint），所以这里也必须查真的，
+    // 不能把屏幕写死成 1920x1080 —— 这台机器真实显示器不是这个尺寸，写死会得到假失败。
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const int SR = mi.rcMonitor.right, SB = mi.rcMonitor.bottom;
+    std::printf("      真实显示器右下角 = (%d,%d)\n", SR, SB);
+    g.vx = mi.rcMonitor.left; g.vy = mi.rcMonitor.top;
+    g.vw = SR - mi.rcMonitor.left; g.vh = SB - mi.rcMonitor.top;
+    g.sel = RECT{ 100, 100, 500, 400 };
+    g.dragHandle = 4;                       // 右下
+    ApplyHandleDrag(POINT{ SR - 7, SB - 7 });       // 距边 7px，在 10px 阈值内
+    std::printf("      实测 sel = (%ld,%ld)-(%ld,%ld)\n", g.sel.left, g.sel.top, g.sel.right, g.sel.bottom);
+    Check(g.sel.right == SR && g.sel.bottom == SB,
+          "拖右下把手到距边 7px → 吸附到屏幕右下角");
+    g.sel = RECT{ 100, 100, 500, 400 };
+    g.dragHandle = 0;                       // 左上
+    ApplyHandleDrag(POINT{ mi.rcMonitor.left + 6, mi.rcMonitor.top + 5 });
+    Check(g.sel.left == mi.rcMonitor.left && g.sel.top == mi.rcMonitor.top, "拖左上把手到距角 6/5px → 吸附到屏幕左上角");
+    g.dragHandle = -1;
+}
+
 int main() {
     // HoleFootprint 会按虚拟屏裁剪，先把假屏尺寸摆上（① 组还没走 ResetSel）
     g.vx = 0; g.vy = 0; g.vw = 1920; g.vh = 1080;
@@ -188,6 +213,7 @@ int main() {
         g.bits = nullptr;
     }
 
+    CheckHandleSnap();
     std::printf(g_fail ? "\n%d FAILED\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

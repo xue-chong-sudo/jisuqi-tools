@@ -157,6 +157,9 @@ int main(int argc, char** argv) {
     Check(got2, "B 剪贴板拿到图");
     Check(w2 == vw - 20 && h2 == vh - 20, "B 右下角吸附到了屏幕边");
 
+    // （C 项"拖把手吸附"已由 handle_drag_test 的 CheckHandleSnap 用确定性单测覆盖：
+    //   这里靠发鼠标消息点不准把手，信号不可信，故删除。）
+
     if (fs) DestroyWindow(fs);
     printf("\n%s（失败项 %d）\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
