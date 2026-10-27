@@ -184,13 +184,37 @@ int main() {
     Check(FindByClass(kMaskClass, pid) != nullptr, "① 复制文字后遮罩仍在（只提示不关窗）");
 
     HWND toast = FindByClass(kToastClass, pid);
-    Check(toast != nullptr, "① 出现「文字已复制到剪贴板」提示窗");
+    Check(toast != nullptr, "① 出现「已复制」提示窗");
+    // 光"窗口存在"不够：分层窗可能是全透明的。直接采提示条中心的**屏幕像素**，
+    // 75% 黑压在画面上，三通道平均必须明显变暗。
+    if (toast) {
+        RECT tr{}; GetWindowRect(toast, &tr);
+        HDC scr = GetDC(nullptr);
+        const COLORREF c = GetPixel(scr, (tr.left + tr.right) / 2, (tr.top + tr.bottom) / 2);
+        ReleaseDC(nullptr, scr);
+        const int avg = (GetRValue(c) + GetGValue(c) + GetBValue(c)) / 3;
+        printf("[drv10]      提示条中心像素 RGB=(%d,%d,%d) 均值 %d（应很暗）\n",
+               GetRValue(c), GetGValue(c), GetBValue(c), avg);
+        Check(avg < 90, "① 提示条真的画出来了（不是因为全透明而看不见）");
+    }
     if (toast) {
         RECT r{}; GetWindowRect(toast, &r);
         printf("[drv10]      提示窗 (%ld,%ld)-(%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
     }
+    RECT trKeep{};
+    if (toast) GetWindowRect(toast, &trKeep);
     Sleep(1900);
     Check(FindByClass(kToastClass, pid) == nullptr, "① 提示窗约 1.5 秒后自己消失");
+    // 消失后同一像素应恢复变亮 —— 这才是"提示条真的在上面"的硬证据
+    if (trKeep.right > trKeep.left) {
+        HDC scr = GetDC(nullptr);
+        const COLORREF c2 = GetPixel(scr, (trKeep.left + trKeep.right) / 2,
+                                          (trKeep.top + trKeep.bottom) / 2);
+        ReleaseDC(nullptr, scr);
+        const int avg2 = (GetRValue(c2) + GetGValue(c2) + GetBValue(c2)) / 3;
+        printf("[drv10]      消失后同点均值 %d（应明显变亮）\n", avg2);
+        Check(avg2 > 27 + 25, "① 消失后该处恢复原样（证明之前那块暗是提示条）");
+    }
 
     // ---------- ② 关闭 ----------
     // 先把还开着的遮罩用 ESC 收掉（复制不再关窗了）

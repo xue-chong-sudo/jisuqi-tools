@@ -2225,8 +2225,8 @@ struct ToastState {
     HDC     mem = nullptr;
     HBITMAP hbm = nullptr;
     SIZE    sz{ 0, 0 };
+    HGDIOBJ oldObj = nullptr; // mem 里原来的位图，销毁前换回
     DWORD   t0 = 0;          // 出现时刻
-    bool    fadingOut = false;
 };
 
 static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2253,6 +2253,7 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_DESTROY: {
             KillTimer(h, 1);
             if (st) {
+                if (st->mem && st->oldObj) SelectObject(st->mem, st->oldObj);
                 if (st->hbm) DeleteObject(st->hbm);
                 if (st->mem) DeleteDC(st->mem);
                 delete st;
@@ -2353,8 +2354,10 @@ static void ShowCopyToast(const wchar_t* msg) {
     st->hbm = hbm;
     st->sz = SIZE{ tw, th };
     st->t0 = GetTickCount();
+    st->oldObj = ob;
     SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(st));
-    SelectObject(mem, ob);          // 位图已画完，DIB 归 st 管理
+    // **不能**在这里 SelectObject(mem, ob) 把 DIB 换出去：UpdateLayeredWindow 读的是
+    // "当前选进源 DC 的位图"，换走之后每次提交的都是空/残留内容 → 提示条完全不显示。
 
     HDC screen2 = GetDC(nullptr);
     BLENDFUNCTION bf0{ AC_SRC_OVER, 0, 0, AC_SRC_ALPHA };   // 从全透明开始淡入
