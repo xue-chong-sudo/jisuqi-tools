@@ -1622,6 +1622,7 @@ static void FinishAdjust(int action) {
 // 目录记在 shot_ui.ini 的 [save] lastdir，和颜色/粗细同一份文件（不碰 settings.ini）。
 static std::wstring g_savePath;       // 用户确认后的目标路径
 static bool         g_saveToFile = false;  // 这次截图要写文件（尾部按它分流）
+static bool         g_copyTextOnly = false; // 右键菜单/Ctrl+C：只要文字，不要图
 
 static std::wstring LoadLastSaveDir() {
     const std::wstring p = ShotUiIni();
@@ -2189,6 +2190,121 @@ static LRESULT CALLBACK TbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProc(h, m, w, l);
 }
 
+// ---- 复制文字：写剪贴板 + 屏幕中下方 2 秒提示 ----
+// 提示做成独立的分层窗（WS_EX_LAYERED + UpdateLayeredWindow）：
+//   ① 它要在遮罩销毁之后继续存在 2 秒，所以不能画在遮罩上；
+//   ② WS_EX_TRANSPARENT/NOACTIVATE 保证它不吃鼠标、不抢焦点，纯粹是个通知。
+static const wchar_t* kToastClass = L"OCRCapToast";
+
+// UTF-8 → CF_UNICODETEXT
+static bool CopyUtf8ToClipboard(const std::string& utf8) {
+    if (utf8.empty()) return false;
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+    if (n <= 0) return false;
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &w[0], n);
+
+    if (!OpenClipboard(nullptr)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    const size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* d = GlobalLock(hg)) {
+            memcpy(d, w.c_str(), bytes);
+            GlobalUnlock(hg);
+            ok = SetClipboardData(CF_UNICODETEXT, hg) != nullptr;
+        }
+        if (!ok) GlobalFree(hg);      // 成功时所有权已交给剪贴板，不能再释放
+    }
+    CloseClipboard();
+    return ok;
+}
+
+static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_TIMER) { DestroyWindow(h); return 0; }
+    if (m == WM_DESTROY) { KillTimer(h, 1); return 0; }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// 在"鼠标所在显示器"的中下（约 68% 高）弹一条提示，2 秒后自己消失。
+static void ShowCopyToast(const wchar_t* msg) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = ToastProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kToastClass;
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    // 量文字宽度定窗宽（+48 给左右留白）。MeasureString 需要一个活着的 Graphics，
+    // 用 1x1 的探针位图；不能对临时 Bitmap 取地址（/permissive 下 C2102）。
+    gp::FontFamily ff(L"Microsoft YaHei");
+    gp::Font f(&ff, 15, gp::FontStyleRegular, gp::UnitPixel);
+    gp::Bitmap probe(1, 1, PixelFormat32bppPARGB);
+    gp::Graphics tmp(&probe);
+    gp::RectF meas;
+    gp::StringFormat sf;
+    sf.SetAlignment(gp::StringAlignmentCenter);
+    sf.SetLineAlignment(gp::StringAlignmentCenter);
+    tmp.MeasureString(msg, -1, &f, gp::PointF(0, 0), &sf, &meas);
+    const int tw = (int)std::ceil(meas.Width) + 48;
+    const int th = 44;
+
+    POINT cur{ 0, 0 };
+    GetCursorPos(&cur);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST), &mi);
+    const int x = (mi.rcMonitor.left + mi.rcMonitor.right) / 2 - tw / 2;
+    const int y = mi.rcMonitor.top + (mi.rcMonitor.bottom - mi.rcMonitor.top) * 68 / 100;
+
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+                             WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                             kToastClass, L"", WS_POPUP, x, y, tw, th,
+                             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!h) return;
+
+    // 32bpp 预乘 alpha 的 DIB，用 GDI+ 画圆角底 + 白字，再整块交给 UpdateLayeredWindow
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = tw;
+    bi.bmiHeader.biHeight = -th;          // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC screen = GetDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP hbm = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC mem = CreateCompatibleDC(screen);
+    if (hbm && bits && mem) {
+        HGDIOBJ ob = SelectObject(mem, hbm);
+        {
+            gp::Bitmap bmp(tw, th, tw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+            gp::Graphics g(&bmp);
+            g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(gp::TextRenderingHintAntiAlias);
+            g.Clear(gp::Color(0, 0, 0, 0));
+            gp::GraphicsPath path;
+            TbRoundPath(path, gp::RectF(0.5f, 0.5f, (float)tw - 1, (float)th - 1), 8.0f);
+            gp::SolidBrush bg(gp::Color(235, 32, 32, 36));
+            g.FillPath(&bg, &path);
+            gp::SolidBrush fg(gp::Color(255, 255, 255, 255));
+            g.DrawString(msg, -1, &f, gp::RectF(0, 0, (float)tw, (float)th), &sf, &fg);
+        }
+        POINT src{ 0, 0 };
+        SIZE sz{ tw, th };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(h, screen, nullptr, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, ob);
+    }
+    if (hbm) DeleteObject(hbm);
+    if (mem) DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    SetTimer(h, 1, 2000, nullptr);        // 2 秒后自己 DestroyWindow
+}
+
 static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case kMsgOcrDone: {
@@ -2405,10 +2521,25 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
             break;
-        case WM_RBUTTONDOWN:
-            // 右键 = 取消（选区态与调整态都是）
+        case WM_RBUTTONDOWN: {
+            // 调整态且已经认出词 → 弹菜单（1 复制文字 / 2 关闭）；
+            // 其余（选区态、还没认字）右键仍是取消。
+            if (g.phase == Phase::Adjust && !g.words.empty()) {
+                POINT pt{ GET_X_LPARAM(l) + g.vx, GET_Y_LPARAM(l) + g.vy };
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 1, L"&1 复制文字");
+                AppendMenuW(menu, MF_STRING, 2, L"&2 关闭");
+                SetForegroundWindow(h);          // 否则点击菜单外部时菜单不会消失
+                const int cmd = TrackPopupMenu(menu,
+                    TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+                DestroyMenu(menu);
+                if (cmd == 1) { g_copyTextOnly = true; FinishAdjust(kTbSave); }
+                else if (cmd == 2) { FinishAdjust(false); }
+                break;
+            }
             FinishAdjust(false);
             break;
+        }
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) {
                 // 选区态 ESC = 取消；调整态 ESC = 保存（用户定案）
@@ -2420,6 +2551,11 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 break;
             }
             if (w == VK_RETURN && g.phase == Phase::Adjust) { FinishAdjust(kTbSave); break; }
+            // Ctrl+C 复制文字（调整态）：与右键菜单「复制文字」同一条路
+            if (g.phase == Phase::Adjust && w == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (!g.words.empty()) { g_copyTextOnly = true; FinishAdjust(kTbSave); }
+                break;
+            }
             // Ctrl+Z 撤销最后一笔标注（只在调整态有意义）
             if (g.phase == Phase::Adjust && w == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 if (!g.annos.empty()) { g.annos.pop_back(); Redraw(); }
@@ -2520,6 +2656,7 @@ CaptureImage CaptureRegionInteractive() {
     // 「下载」的目标路径是"这一次截图"的临时状态，必须每轮清掉：
     // 否则上一轮存过的文件会一直挂着，下次点 ESC 保存也会跟着写一遍同一个路径。
     g_saveToFile = false;
+    g_copyTextOnly = false;
     g_savePath.clear();
     // 上一轮可能还有识别在跑（用户在识别完成前就保存/取消了）。作废它，
     // 并清掉暂存区，免得旧词表漏到这一轮的画面上。
@@ -2717,12 +2854,17 @@ CaptureImage CaptureRegionInteractive() {
     // 就是用户看到的成品，不要再画一遍）。这条必须排在最前，否则会被"有选中词"
     // 或"saveToClip"抢走。
     std::string picked = PickedTextUtf8();
-    if (g_saveToFile && !g_savePath.empty()) {
+    if (g_copyTextOnly) {
+        // 右键「复制文字」/ Ctrl+C：只写文字，不写图，然后给 2 秒提示。
+        g_shotCopied = true;
+        if (CopyUtf8ToClipboard(picked)) ShowCopyToast(L"文字已复制到剪贴板");
+    } else if (g_saveToFile && !g_savePath.empty()) {
         g_shotCopied = true;                 // 已经给了用户结果，不用再弹旧结果窗
         SaveImageToFile(out, g_savePath);
     } else if (!picked.empty()) {
         g_shotCopied = true;
         ShotCopyImageThenText(out, picked);
+        ShowCopyToast(L"文字已复制到剪贴板");
     } else if (g.ocrWanted) {         // 兜底：整块识别（工具栏上已无此按钮，留着不删）
         g_shotCopied = true;
         ShotOcrAndCopy(out);          // 内部：先写图、再跑 OCR、再写文字
