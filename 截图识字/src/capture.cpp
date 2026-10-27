@@ -541,6 +541,15 @@ static OverlayState BuildOverlayState() {
         hole = g.sel;
     } else if (!g.drag) {
         hole = FindHoveredWindow(g.cur);
+        // 悬停兜底：鼠标底下没有窗口（裸桌面/壁纸）时，亮**整个显示器**。
+        // 用户要的就是"鼠标指到哪就自动亮哪"：桌面上没有窗口可亮，那就亮整屏，
+        // 等于"悬停即吸附全屏"。桌面本身是 Shell 窗口、被 IsShellChrome 排除了，
+        // 所以这里必须显式兜底，否则整屏永远不会亮。
+        if (REmpty(hole)) {
+            HMONITOR hm = MonitorFromPoint(g.cur, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{ sizeof(mi) };
+            if (GetMonitorInfoW(hm, &mi)) hole = mi.rcMonitor;
+        }
     }
     if (REmpty(hole)) return s;                     // 什么都没有：整屏纯遮罩
     hole.left -= g.vx; hole.right -= g.vx;

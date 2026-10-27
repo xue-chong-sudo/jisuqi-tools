@@ -68,6 +68,37 @@ static void CheckHandleSnap() {
     g.dragHandle = -1;
 }
 
+
+// 悬停兜底：鼠标底下没有任何窗口（裸桌面）时，要亮**整个显示器**。
+// 用户："鼠标挪到边上，还是不能自动吸附全屏" —— 他要的是悬停即亮。
+static void CheckHoverFallback() {
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi);
+    g.vx = mi.rcMonitor.left; g.vy = mi.rcMonitor.top;
+    g.vw = mi.rcMonitor.right - g.vx; g.vh = mi.rcMonitor.bottom - g.vy;
+    g.phase = Phase::Select;
+    g.drag = false;
+    g_wins.clear();                       // 没有任何可吸附窗口 = 裸桌面
+    g.cur = POINT{ g.vx + g.vw / 2, g.vy + g.vh / 2 };
+    OverlayState s = BuildOverlayState();
+    std::printf("      悬停(空桌面) → hole = (%ld,%ld)-(%ld,%ld)  显示器 = (%ld,%ld)-(%ld,%ld)\n",
+                s.hole.left, s.hole.top, s.hole.right, s.hole.bottom,
+                mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom);
+    Check(s.hole.left == 0 && s.hole.top == 0 &&
+          s.hole.right == g.vw && s.hole.bottom == g.vh,
+          "悬停空桌面 → 亮整个屏幕");
+
+    // 有窗口时必须优先亮那个窗口，不能被兜底抢走
+    RECT wr{ g.vx + 10, g.vy + 10, g.vx + 210, g.vy + 160 };
+    g_wins.push_back(WinInfo{ nullptr, wr, 0 });
+    g.cur = POINT{ g.vx + 50, g.vy + 50 };
+    OverlayState s2 = BuildOverlayState();
+    Check(s2.hole.right - s2.hole.left == 200 && s2.hole.bottom - s2.hole.top == 150,
+          "有窗口时仍优先亮该窗口（不被整屏兜底抢走）");
+    g_wins.clear();
+    g.phase = Phase::Select;
+}
+
 int main() {
     // HoleFootprint 会按虚拟屏裁剪，先把假屏尺寸摆上（① 组还没走 ResetSel）
     g.vx = 0; g.vy = 0; g.vw = 1920; g.vh = 1080;
@@ -214,6 +245,7 @@ int main() {
     }
 
     CheckHandleSnap();
+    CheckHoverFallback();
     std::printf(g_fail ? "\n%d FAILED\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
