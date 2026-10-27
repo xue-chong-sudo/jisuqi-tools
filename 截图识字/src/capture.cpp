@@ -301,6 +301,26 @@ static void Snap(POINT& p) {
         else if (std::abs(p.y - w.bottom) <= t) sy = w.bottom;
         if (sx != p.x || sy != p.y) { p.x = sx; p.y = sy; return; }
     }
+
+    // 兜底：窗口都吸不上时，吸附到**显示器边缘**。
+    //
+    // 为什么必须有这条（用户："全屏不能吸附"）：桌面是 Shell 窗口，被 IsShellChrome
+    // 排除了，所以"什么都没开、只有桌面"时 g_wins 是空的 —— 上面那个循环一次都进不去，
+    // 拖到离屏幕边 7px 也吸不上，整屏永远框不准（实测 1893x1053，应为 1900x1060）。
+    // 有全屏/最大化窗口时窗口边正好压在屏幕边上，本来就能吸，所以这个问题只在
+    // "裸桌面"和"全屏应用没有可枚举窗口"时才暴露，更隐蔽。
+    //
+    // 用 rcMonitor 而不是 rcWork：截图常常要连任务栏一起框进去。
+    HMONITOR hm = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    if (!GetMonitorInfoW(hm, &mi)) return;
+    const RECT& s = mi.rcMonitor;
+    int sx = p.x, sy = p.y;
+    if (std::abs(p.x - s.left)      <= t) sx = s.left;
+    else if (std::abs(p.x - s.right) <= t) sx = s.right;
+    if (std::abs(p.y - s.top)       <= t) sy = s.top;
+    else if (std::abs(p.y - s.bottom) <= t) sy = s.bottom;
+    p.x = sx; p.y = sy;
 }
 
 // 命中 Z 序最靠上的窗口（g_wins 已按 z 升序，第一个命中就是顶层那个）。
@@ -2352,7 +2372,17 @@ static LRESULT CALLBACK CapWnd(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (dx < 5 && dy < 5) {
                     // Single click: capture the whole hovered window.
                     RECT hov = FindHoveredWindow(g.start);
-                    if (hov.right > hov.left) g.sel = hov;
+                    if (hov.right > hov.left) {
+                        g.sel = hov;
+                    } else {
+                        // 空处单击（裸桌面：桌面是 Shell 窗口，被 IsShellChrome 排除，
+                        // 所以 FindHoveredWindow 什么也找不到）——退一步选**整个显示器**。
+                        // 这是"截整屏"最短的动作；比"什么都不发生"有用，且选区会立刻
+                        // 铺满屏幕，用户一眼就知道选中了什么，误点了右键/ESC 即可退出。
+                        HMONITOR hm = MonitorFromPoint(g.start, MONITOR_DEFAULTTONEAREST);
+                        MONITORINFO mi{ sizeof(mi) };
+                        if (GetMonitorInfoW(hm, &mi)) g.sel = mi.rcMonitor;
+                    }
                 }
                 // 不再销毁遮罩：有有效选区就进入调整态（微信截图同款），
                 // 由 ESC / 保存 决定最终落盘。选区太小（误点）则留在选区态。
